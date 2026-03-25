@@ -30,7 +30,7 @@ jobs:
           EMAIL_PASSWORD:     ${{ secrets.EMAIL_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python cerca_lavoro_lecce_v3.py
+        run: python cerca_lavoro_categorie_protette.py
 
       # Salva TUTTI i file di output come artefatto scaricabile
       - name: Salva risultati come artefatto
