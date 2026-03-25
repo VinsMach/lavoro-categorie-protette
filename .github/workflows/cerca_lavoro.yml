@@ -1,65 +1,58 @@
-name: Cerca Lavoro - Categorie Protette Puglia
+name: Cerca Lavoro - Categorie Protette Lecce
 
 on:
-  # Esegui ogni giorno alle 08:00 ora italiana (07:00 UTC)
   schedule:
-    - cron: '0 7 * * *'
-  # Permetti esecuzione manuale dalla tab Actions
-  workflow_dispatch:
+    - cron: '0 7 * * *'   # 08:00 ora italiana
+  workflow_dispatch:        # esecuzione manuale
 
 jobs:
   cerca-lavoro:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
-      # 1. Scarica il codice del repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Installa Python
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # 3. Installa le dipendenze Python
       - name: Installa dipendenze
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      # 4. Esegui lo script di ricerca
       - name: Esegui ricerca annunci
         env:
           EMAIL_DESTINATARIO: ${{ secrets.EMAIL_DESTINATARIO }}
-          EMAIL_MITTENTE: ${{ secrets.EMAIL_MITTENTE }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_MITTENTE:     ${{ secrets.EMAIL_MITTENTE }}
+          EMAIL_PASSWORD:     ${{ secrets.EMAIL_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python cerca_lavoro_categorie_protette.py
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python cerca_lavoro_lecce_v3.py
 
-      # 5. Salva i risultati come artefatto scaricabile (30 giorni)
+      # Salva TUTTI i file di output come artefatto scaricabile
       - name: Salva risultati come artefatto
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: risultati-lavoro-${{ github.run_id }}
+          name: risultati-lecce-${{ github.run_id }}
           path: |
-            risultati_lavoro.txt
-            risultati_lavoro.json
+            risultati_lecce.html
+            risultati_lecce.txt
+            risultati_lecce.json
             cerca_lavoro.log
-          retention-days: 30
+          retention-days: 60
 
-      # 6. Aggiorna il database SQLite nel repository (per memoria persistente)
-      - name: Aggiorna database nel repository
+      # Aggiorna DB e risultati nel repository (memoria persistente)
+      - name: Aggiorna DB e risultati nel repo
         if: always()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add lavoro_categorie_protette.db risultati_lavoro.txt risultati_lavoro.json || true
-          git diff --staged --quiet || git commit -m "Aggiornamento automatico $(date '+%d/%m/%Y %H:%M')"
+          git config --local user.name "GitHub Action Bot"
+          git add lavoro_lecce_cp.db risultati_lecce.txt risultati_lecce.json risultati_lecce.html || true
+          git diff --staged --quiet || git commit -m "📋 Aggiornamento $(date '+%d/%m/%Y %H:%M')"
           git push || true
