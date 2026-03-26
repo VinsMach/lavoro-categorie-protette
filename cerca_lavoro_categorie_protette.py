@@ -749,31 +749,175 @@ def scrape_entity(entity: dict) -> list[Annuncio]:
 # BUILDER COMUNI
 # ============================================================
 
-def build_comune_entity(nome: str) -> dict:
-    slug = slugify_comune(nome)
-    base_at  = f"https://amministrazionetrasparente.comune.{slug}.le.it"
+# ============================================================
+# CRAWLER INTELLIGENTE PER COMUNI
+# Invece di indovinare l'URL, naviga la homepage e segue
+# i link che portano a "concorsi", "bandi", "trasparenza"
+# ============================================================
+
+# Parole che identificano un link di navigazione verso sezione concorsi
+LINK_CONCORSI_HINTS = [
+    "concorsi", "bandi di concorso", "bandi concorso",
+    "selezioni", "selezione personale", "selezione del personale",
+    "reclutamento", "lavora con noi", "avvisi pubblici",
+    "amministrazione trasparente", "trasparenza",
+    "personale", "risorse umane",
+]
+
+# Parole nei link che sicuramente NON portano a concorsi
+LINK_SKIP_HINTS = [
+    "gara", "appalto", "appalti", "forniture", "servizi",
+    "privacy", "cookie", "contatti", "news", "eventi",
+    "notizie", "turismo", "cultura", "sport", "sociale",
+    "login", "logout", "registra", "pec", "mail",
+    "facebook", "twitter", "instagram", "youtube",
+    "sitemap", "accessibilita", "dichiarazione",
+    "ztl", "rifiuti", "tributi", "tari", "imu",
+    "urbanistica", "edilizia", "suap",
+]
+
+def _link_porta_a_concorsi(href: str, text: str) -> bool:
+    """Valuta se un link della homepage potrebbe portare a sezione concorsi."""
+    combined = (href + " " + text).lower()
+    if any(skip in combined for skip in LINK_SKIP_HINTS):
+        return False
+    return any(hint in combined for hint in LINK_CONCORSI_HINTS)
+
+
+def _cerca_url_concorsi_in_pagina(soup: BeautifulSoup, base_url: str) -> list[str]:
+    """
+    Dato il BeautifulSoup di una pagina (homepage o sezione),
+    restituisce tutti gli URL che sembrano portare a concorsi/bandi.
+    """
+    candidati = []
+    visti = set()
+    for a_tag in soup.find_all("a", href=True):
+        href = assoluto(a_tag.get("href",""), base_url)
+        text = norm(a_tag.get_text(" ", strip=True))
+        if href in visti or not href.startswith("http"):
+            continue
+        visti.add(href)
+        if _link_porta_a_concorsi(href, text):
+            candidati.append(href)
+    return candidati
+
+
+def crawl_comune(nome: str, slug: str) -> list[Annuncio]:
+    """
+    Strategia a 3 livelli per trovare i bandi di un comune:
+    1. Prova gli URL diretti noti (veloci, zero richieste se funzionano)
+    2. Se nessuno funziona: scarica la homepage e segue i link
+    3. Se trova una sezione "trasparenza/personale": scende ancora un livello
+
+    Questo gestisce tutti i CMS diversi (Joomla, WordPress, OpenWeb,
+    comuni-italiani.it, ecc.) senza dover conoscere l'URL a priori.
+    """
     base_www = f"https://www.comune.{slug}.le.it"
-    return {
+    base_at  = f"https://amministrazionetrasparente.comune.{slug}.le.it"
+    entity = {
         "nome": f"Comune di {nome}",
         "fonte": f"Comune di {nome}",
         "ente": f"Comune di {nome}",
         "tipo": "PA",
-        "ssl": False,  # verify=False perché molti comuni hanno cert problematici
-        "urls": [
-            f"{base_at}/amministrazione-trasparente/bandi-di-concorso",
-            f"{base_at}/bandi-di-concorso",
-            f"{base_www}/amministrazione-trasparente/bandi-di-concorso",
-            f"{base_www}/concorsi",
-            f"{base_www}/bandi-concorso",
-        ],
     }
+    risultati = []
+    url_tentati = set()
+
+    # ── Livello 1: URL diretti più comuni ──────────────────────────
+    url_diretti = [
+        # sottodominio trasparenza
+        f"{base_at}/amministrazione-trasparente/bandi-di-concorso",
+        f"{base_at}/bandi-di-concorso",
+        # www con path standard
+        f"{base_www}/amministrazione-trasparente/bandi-di-concorso",
+        f"{base_www}/amministrazione/attivita/concorsi",          # Galatina-style
+        f"{base_www}/amministrazione/attivita/concorsi/bandi-di-concorso-per-reclutamento-personale",
+        f"{base_www}/concorsi",
+        f"{base_www}/bandi-concorso",
+        f"{base_www}/selezioni",
+        f"{base_www}/argomento/concorsi/",
+        # portale servizi di Galatina e simili
+        f"https://servizi.comune.{slug}.le.it/openweb/trasparenza/pagina.php?id=28",
+    ]
+
+    for url in url_diretti:
+        if url in url_tentati:
+            continue
+        url_tentati.add(url)
+        soup = get_soup(url, timeout=8, ssl=False)
+        if not soup:
+            continue
+        found = extract_items_from_page(entity, soup, url)
+        if found:
+            risultati.extend(found)
+            log.debug(f"  {nome} livello1: {len(found)} da {url}")
+            return risultati   # trovato subito, non serve altro
+
+    # ── Livello 2: homepage → segui link ──────────────────────────
+    homepage_urls = [base_www, base_at]
+    link_intermedi = []
+
+    for hp in homepage_urls:
+        if hp in url_tentati:
+            continue
+        url_tentati.add(hp)
+        soup_hp = get_soup(hp, timeout=8, ssl=False)
+        if not soup_hp:
+            continue
+        candidati = _cerca_url_concorsi_in_pagina(soup_hp, hp)
+        link_intermedi.extend(candidati)
+        log.debug(f"  {nome} homepage {hp}: {len(candidati)} link candidati")
+
+        # Prova anche a estrarre annunci direttamente dalla homepage
+        found_hp = extract_items_from_page(entity, soup_hp, hp)
+        if found_hp:
+            risultati.extend(found_hp)
+
+    # ── Livello 3: segue i link intermedi ─────────────────────────
+    for url in link_intermedi[:6]:   # max 6 livelli intermedi per comune
+        if url in url_tentati:
+            continue
+        url_tentati.add(url)
+        soup = get_soup(url, timeout=8, ssl=False)
+        if not soup:
+            continue
+        found = extract_items_from_page(entity, soup, url)
+        if found:
+            risultati.extend(found)
+            log.debug(f"  {nome} livello3: {len(found)} da {url}")
+            continue
+
+        # Se la pagina è una sezione-indice (trasparenza, personale),
+        # scendi ancora un livello cercando link a concorsi
+        sotto_link = _cerca_url_concorsi_in_pagina(soup, url)
+        for sotto_url in sotto_link[:4]:
+            if sotto_url in url_tentati:
+                continue
+            url_tentati.add(sotto_url)
+            soup2 = get_soup(sotto_url, timeout=8, ssl=False)
+            if not soup2:
+                continue
+            found2 = extract_items_from_page(entity, soup2, sotto_url)
+            risultati.extend(found2)
+
+    return risultati
+
+
+def scrape_comune(nome: str) -> list[Annuncio]:
+    """Wrapper che chiama crawl_comune e logga il risultato."""
+    slug = slugify_comune(nome)
+    try:
+        risultati = crawl_comune(nome, slug)
+        if risultati:
+            log.info(f"   🏘️  {nome}: {len(risultati)} candidati")
+        return risultati
+    except Exception as e:
+        log.warning(f"   {nome}: errore → {e}")
+        return []
 
 
 def all_entities() -> list[dict]:
-    out = list(ENTI_SALENTO)
-    for comune in COMUNI_LECCE:
-        out.append(build_comune_entity(comune))
-    return out
+    return list(ENTI_SALENTO)
 
 
 # ============================================================
@@ -1148,6 +1292,28 @@ def send_email(items: list[Annuncio]) -> None:
         log.error(f"Email failed → {e}")
 
 
+def _tg_send(token: str, chat_id: str, text: str) -> bool:
+    """Invia un singolo messaggio Telegram senza Markdown (più robusto)."""
+    # Tronca a 4096 char (limite Telegram)
+    text = text[:4096]
+    try:
+        r = SESSION.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                # Niente parse_mode — testo puro, zero problemi con caratteri speciali
+                "disable_web_page_preview": True,
+            },
+            timeout=12,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log.error(f"Telegram send failed → {e}")
+        return False
+
+
 def send_telegram(items: list[Annuncio]) -> None:
     token   = CONFIG["telegram_bot_token"]
     chat_id = CONFIG["telegram_chat_id"]
@@ -1155,30 +1321,40 @@ def send_telegram(items: list[Annuncio]) -> None:
         return
 
     art16 = [a for a in items if a.art16]
-    lines = [
-        "🔔 *Categorie Protette — Lecce / Salento*",
-        f"Nuovi: *{len(items)}* · Art.16: *{len(art16)}*", "",
-    ]
-    for a in items[:12]:
-        tags = " | ".join(filter(None,[
-            "⭐ ART.16" if a.art16 else "",
-            "✅ ART.1"  if a.art1  else "",
-            a.stato or "",
-        ]))
-        title = a.titolo[:70].replace("[","(").replace("]",")")
-        lines += [f"• *{title}*", f"  `{a.fonte}` {tags}", f"  {a.url}"]
+    art1  = [a for a in items if a.art1 and not a.art16]
 
-    try:
-        r = SESSION.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": "\n".join(lines),
-                  "parse_mode": "Markdown", "disable_web_page_preview": True},
-            timeout=12,
+    # ── Messaggio 1: riepilogo ──────────────────────────────────
+    sommario = (
+        f"Categorie Protette — Lecce / Salento\n"
+        f"Nuovi annunci: {len(items)}\n"
+        f"Art.16 diretti: {len(art16)}\n"
+        f"Art.1 L.68/99: {len(art1)}\n"
+        f"Aggiornato: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    )
+    _tg_send(token, chat_id, sommario)
+
+    # ── Messaggi 2+: un messaggio per annuncio (max 15) ─────────
+    # Così ogni annuncio è leggibile e cliccabile separatamente
+    prioritari = art16 + art1 + [a for a in items if not a.art1 and not a.art16]
+    for a in prioritari[:15]:
+        tags = []
+        if a.art16: tags.append("ART.16 ACCESSO DIRETTO")
+        if a.art1:  tags.append("ART.1 L.68/99")
+        if a.stato: tags.append(a.stato)
+
+        card = (
+            f"{'[ART.16]' if a.art16 else '[ART.1]' if a.art1 else '[PA]'} "
+            f"{a.titolo[:100]}\n"
+            f"Ente: {a.ente or a.fonte}\n"
+            + (f"Scadenza: {a.scadenza}\n" if a.scadenza else "")
+            + (f"Posti: {a.posti}\n" if a.posti else "")
+            + ("\n".join(tags) + "\n" if tags else "")
+            + f"{a.url}"
         )
-        r.raise_for_status()
-        log.info("📱 Telegram inviato")
-    except Exception as e:
-        log.error(f"Telegram failed → {e}")
+        _tg_send(token, chat_id, card)
+        time.sleep(0.3)   # piccola pausa anti-rate-limit
+
+    log.info(f"Telegram: inviati {min(len(prioritari), 15) + 1} messaggi")
 
 
 # ============================================================
@@ -1188,7 +1364,7 @@ def send_telegram(items: list[Annuncio]) -> None:
 def main() -> None:
     print("\n" + "═" * 80)
     print("CERCA LAVORO — CATEGORIE PROTETTE L.68/99 — LECCE / SALENTO")
-    print("96 comuni + enti pubblici + aggregatori · Art.16 + Art.1")
+    print("96 comuni (crawler intelligente) + enti pubblici + aggregatori")
     print("═" * 80 + "\n")
 
     conn = init_db(CONFIG["db_path"])
@@ -1200,13 +1376,19 @@ def main() -> None:
         except Exception as e:
             log.error(f"{fn.__name__} → {e}")
 
+    # Enti fissi (ASL, Provincia, aggregatori, ARPAL, Università, Comune Lecce)
     enti = all_entities()
-    log.info(f"Enti da scandire: {len(enti)}")
+    log.info(f"Enti fissi da scandire: {len(enti)}")
     for entity in enti:
         try:
             raw.extend(scrape_entity(entity))
         except Exception as e:
             log.error(f"Entity {entity['nome']} → {e}")
+
+    # Comuni della provincia — crawler intelligente
+    log.info(f"Comuni da scansionare con crawler: {len(COMUNI_LECCE)}")
+    for nome_comune in COMUNI_LECCE:
+        raw.extend(scrape_comune(nome_comune))
 
     log.info(f"Totale grezzo: {len(raw)}")
 
