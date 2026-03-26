@@ -272,6 +272,23 @@ def scarica_tutti_dettagli(annunci: list, max_annunci: int = 50) -> list:
         [a for a in annunci if not a.art1 and not a.art16]
     )
 
+    # Filtra prima gli annunci che sono chiaramente link di navigazione
+    TITOLI_NAV = {"home", "accedi all'area personale", "vai al footer",
+                  "vai ai contenuti", "informativa privacy", "note legali",
+                  "dichiarazione di accessibilità", "albo pretorio",
+                  "amministrazione trasparente", "segnalazione disservizio",
+                  "prenotazione appuntamento", "richiesta assistenza",
+                  "piano di miglioramento", "regione puglia", "città di otranto",
+                  "vivere il comune", "discover otranto", "gestione rifiuti",
+                  "comunicati", "anagrafe e stato civile", "atti e documenti",
+                  "in primo piano", "organi di governo", "aree amministrative",
+                  "personale amministrativo", "documenti e dati", "autorizzazioni",
+                  "urp - sportello", "leggi le faq"}
+    ordinati = [a for a in ordinati
+                if a.titolo.lower().strip() not in TITOLI_NAV
+                and len(a.titolo.strip()) >= 20
+                and not a.titolo.lower().startswith(("vai ", "accedi ", "skip "))]
+
     log.info(f"⬇️  Scarico dettagli per {min(len(ordinati), max_annunci)} annunci...")
     for i, ann in enumerate(ordinati[:max_annunci]):
         log.info(f"  [{i+1}/{min(len(ordinati), max_annunci)}] {ann.titolo[:55]}...")
@@ -631,48 +648,96 @@ def scrape_gazzetta_ufficiale() -> list[Annuncio]:
 # ─────────────────────────────────────────────────────────────
 #  FONTE 5: Comune di Lecce — URL reali verificati
 # ─────────────────────────────────────────────────────────────
+def _estrai_annunci_da_soup(soup: BeautifulSoup, fonte: str,
+                            ente: str, base_url: str,
+                            solo_rilevanti: bool = False) -> list[Annuncio]:
+    """
+    Estrae annunci da una pagina già scaricata.
+    Cerca link che abbiano testo significativo e puntino a pagine interne.
+    solo_rilevanti=True → filtra solo annunci con keyword concorso/bando/selezione.
+    """
+    risultati = []
+    # Selettori in ordine di specificità
+    selettori = [
+        "article", "li.bando", "li.concorso", "tr",
+        "div.item", "div.notizia", ".entry", ".card",
+        # fallback: tutti i link con testo sufficientemente lungo
+        "a[href]",
+    ]
+    visti = set()
+    for sel in selettori:
+        for el in soup.select(sel):
+            link_el = el if el.name == "a" else el.select_one("a[href]")
+            if not link_el:
+                continue
+            href = link_el.get("href", "")
+            if not href or href in visti or href.startswith("#"):
+                continue
+            visti.add(href)
+            titolo = link_el.get_text(strip=True)
+            testo_ctx = el.get_text(" ", strip=True)
+            # Filtra link di navigazione (troppo corti o generici)
+            if len(titolo) < 15:
+                continue
+            parole_nav = {"home","cookie","privacy","accessibilità","contatti",
+                          "albo pretorio","mappa del sito","footer","header",
+                          "vai al","vai ai","accedi","registrati","logout",
+                          "facebook","twitter","instagram","youtube",
+                          "segnalazione","newsletter","pec","mail","email",
+                          "informativa","nota legale","dichiarazione","prenotaz"}
+            if titolo.lower().strip() in parole_nav:
+                continue
+            if any(titolo.lower().startswith(p) for p in parole_nav):
+                continue
+            if solo_rilevanti:
+                kw_ann = ["concorso","bando","selezione","avviso","assunzione",
+                          "reclutamento","mobilità","stabilizzazione","posto",
+                          "istruttore","funzionario","collaboratore","operatore",
+                          "tecnico","dirigente","graduatoria","categoria protetta",
+                          "disabil","collocamento","art. 1","art. 16"]
+                if not contiene(titolo + " " + testo_ctx, kw_ann):
+                    continue
+            href_abs = assoluto(href, base_url)
+            risultati.append(Annuncio(
+                titolo=titolo[:200], fonte=fonte, url=href_abs,
+                data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
+                descrizione=testo_ctx[:300], ente=ente, tipo="PA",
+                art16=rileva_art16(titolo + testo_ctx),
+                art1=rileva_art1(titolo + testo_ctx),
+            ))
+    return risultati
+
+
 def scrape_comune_lecce() -> list[Annuncio]:
     log.info("🏙️  Comune di Lecce...")
     annunci = []
+
+    # Il sito del comune usa un SOTTODOMINIO separato per la trasparenza
+    TRASPARENZA = "https://amministrazionetrasparente.comune.lecce.it"
     BASE = "https://www.comune.lecce.it"
 
-    # URL reali del sito del Comune di Lecce
-    urls = [
-        f"{BASE}/myportal/C_L049/amministrazione-trasparente/personale/"
-        f"selezione-del-personale/avvisi-di-selezione-e-concorsi",
-        f"{BASE}/myportal/C_L049/home/-/bacheca/bandi-di-concorso",
-        f"{BASE}/myportal/C_L049/home/-/bacheca/avvisi",
-        f"{BASE}/it/trasparenza/bandi-gare-e-contratti/bandi-di-concorso",
-        f"{BASE}/concorsi",
-        f"{BASE}/lavora-con-noi",
-        # Sezione trasparenza standard PA
-        f"{BASE}/amministrazione-trasparente/personale/avvisi-bandi-concorsi",
+    urls_prioritari = [
+        # Sottodominio trasparenza — URL VERIFICATO dalla ricerca
+        f"{TRASPARENZA}/amministrazione-trasparente/bandi-di-concorso",
+        f"{TRASPARENZA}/amministrazione-trasparente/bandi-di-concorso/graduatorie-ancora-vigenti-e-assunzioni-effettuate",
+        # Sito principale — sezione notizie concorsi
+        f"{BASE}/news?categoria=concorsi",
+        f"{BASE}/aree-tematiche/lavoro",
+        f"{BASE}/aree-tematiche/uffici-comunali/ufficio-concorsi",
     ]
 
-    for url in urls:
-        soup = get_soup(url, timeout=CONFIG["timeout_lento"])
+    for url in urls_prioritari:
+        soup = get_soup(url, timeout=CONFIG["timeout_lento"], verify_ssl=True)
         if not soup:
             continue
-        trovati = 0
-        for item in soup.select("article, li, tr, .entry, .notizia, div.item"):
-            testo = item.get_text(" ", strip=True)
-            link_el = item.select_one("a[href]")
-            titolo_el = item.select_one("h2,h3,h4,a,.title,.titolo")
-            if not titolo_el or len(testo) < 10:
-                continue
-            titolo = titolo_el.get_text(strip=True)[:200]
-            href = assoluto(link_el["href"] if link_el else "", BASE)
-
-            annunci.append(Annuncio(
-                titolo=titolo, fonte="Comune di Lecce",
-                url=href,
-                data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
-                descrizione=testo[:300], ente="Comune di Lecce", tipo="PA",
-                art16=rileva_art16(testo), art1=rileva_art1(testo),
-            ))
-            trovati += 1
-        if trovati > 0:
-            break  # URL funzionante trovato
+        trovati = _estrai_annunci_da_soup(
+            soup, "Comune di Lecce", "Comune di Lecce",
+            TRASPARENZA if "amministrazionetrasparente" in url else BASE,
+            solo_rilevanti=True
+        )
+        annunci.extend(trovati)
+        if trovati:
+            log.debug(f"  Lecce: {len(trovati)} da {url}")
 
     log.info(f"  → {len(annunci)} Comune Lecce")
     return annunci
@@ -681,58 +746,59 @@ def scrape_comune_lecce() -> list[Annuncio]:
 # ─────────────────────────────────────────────────────────────
 #  FONTE 6: Comuni provincia di Lecce
 # ─────────────────────────────────────────────────────────────
+# Comuni provincia di Lecce — codice catastale per il sottodominio trasparenza
+# Schema URL: https://amministrazionetrasparente.comune.NOME.le.it/
+# oppure: https://www.comune.NOME.le.it/amministrazione-trasparente/bandi-di-concorso
 COMUNI_LECCE = {
-    "Galatina":   "https://www.comune.galatina.le.it",
-    "Nardò":      "https://www.comune.nardo.le.it",
-    "Gallipoli":  "https://www.comune.gallipoli.le.it",
-    "Maglie":     "https://www.comune.maglie.le.it",
-    "Tricase":    "https://www.comune.tricase.le.it",
-    "Casarano":   "https://www.comune.casarano.le.it",
-    "Copertino":  "https://www.comune.copertino.le.it",
-    "Galatone":   "https://www.comune.galatone.le.it",
-    "Ugento":     "https://www.comune.ugento.le.it",
-    "Otranto":    "https://www.comune.otranto.le.it",
-    "Poggiardo":  "https://www.comune.poggiardo.le.it",
-    "Squinzano":  "https://www.comune.squinzano.le.it",
+    "Galatina":   ("L049", "galatina"),
+    "Nardò":      ("F842", "nardo"),
+    "Gallipoli":  ("D883", "gallipoli"),
+    "Maglie":     ("E815", "maglie"),
+    "Tricase":    ("L419", "tricase"),
+    "Casarano":   ("B978", "casarano"),
+    "Copertino":  ("C978", "copertino"),
+    "Galatone":   ("D882", "galatone"),
+    "Ugento":     ("L484", "ugento"),
+    "Otranto":    ("G188", "otranto"),
+    "Alessano":   ("A184", "alessano"),
+    "Campi Salentina": ("B506", "campisalentina"),
+    "Squinzano":  ("I930", "squinzano"),
+    "Leverano":   ("E563", "leverano"),
 }
 
-CONCORSI_PATHS_COMUNI = [
-    "/amministrazione-trasparente/personale/selezione-del-personale",
-    "/bandi-di-concorso",
-    "/concorsi",
-    "/lavora-con-noi",
-    "/avvisi",
-    "/it/concorsi",
-]
+def _url_comuni_da_provare(slug: str) -> list[str]:
+    """Genera lista URL da provare per un comune, dal più probabile al meno."""
+    base_www = f"https://www.comune.{slug}.le.it"
+    base_at  = f"https://amministrazionetrasparente.comune.{slug}.le.it"
+    return [
+        # Sottodominio trasparenza (standard moderno)
+        f"{base_at}/amministrazione-trasparente/bandi-di-concorso",
+        f"{base_at}/bandi-di-concorso",
+        # Sito principale con path trasparenza
+        f"{base_www}/amministrazione-trasparente/personale/selezione-del-personale",
+        f"{base_www}/it/amministrazione-trasparente/bandi-di-concorso",
+        # Path semplice
+        f"{base_www}/bandi-concorso",
+        f"{base_www}/concorsi-pubblici",
+    ]
 
 def scrape_comuni_lecce() -> list[Annuncio]:
-    log.info("🏘️  Comuni provincia di Lecce...")
+    log.info("🏘️  Comuni provincia di Lecce (sottodomini trasparenza)...")
     annunci = []
 
-    for nome, base in COMUNI_LECCE.items():
-        successo = False
-        for path in CONCORSI_PATHS_COMUNI:
-            url = base + path
-            soup = get_soup(url, timeout=CONFIG["timeout_lento"], verify_ssl=False)
+    for nome, (cod, slug) in COMUNI_LECCE.items():
+        for url in _url_comuni_da_provare(slug):
+            soup = get_soup(url, timeout=12, verify_ssl=False)
             if not soup:
                 continue
-            for link in soup.select("a[href]"):
-                testo = link.get_text(strip=True)
-                if len(testo) < 10:
-                    continue
-                href = assoluto(link["href"], base)
-                testo_full = testo + " " + nome
-                annunci.append(Annuncio(
-                    titolo=testo[:200], fonte=f"Comune {nome}",
-                    url=href,
-                    data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
-                    ente=f"Comune di {nome}", tipo="PA",
-                    art16=rileva_art16(testo), art1=rileva_art1(testo),
-                ))
-            successo = True
-            break
-        if not successo:
-            log.debug(f"  {nome}: nessun URL funzionante")
+            trovati = _estrai_annunci_da_soup(
+                soup, f"Comune {nome}", f"Comune di {nome}",
+                url, solo_rilevanti=True
+            )
+            if trovati:
+                annunci.extend(trovati)
+                log.debug(f"  {nome}: {len(trovati)} annunci da {url}")
+                break  # URL funzionante trovato per questo comune
 
     log.info(f"  → {len(annunci)} Comuni provincia LE")
     return annunci
@@ -915,37 +981,55 @@ def scrape_indeed() -> list[Annuncio]:
 #  FONTE 11: Portale Lavoro per Te (ANPAL / MLPS)
 #  Sezione offerte con collocamento mirato
 # ─────────────────────────────────────────────────────────────
-def scrape_lavoroperte() -> list[Annuncio]:
-    log.info("🔎 Portale LavoroPerTe (ANPAL)...")
+def scrape_aggregatori_lecce() -> list[Annuncio]:
+    """
+    Aggrega da siti che già indicizzano bene i concorsi di Lecce
+    e hanno URL stabili e verificati.
+    """
+    log.info("🔎 Aggregatori concorsi Lecce...")
     annunci = []
 
-    urls = [
-        "https://www.lavoroperte.gov.it/offerte?regione=puglia&categoria=categorie-protette",
-        "https://www.lavoroperte.gov.it/offerte?provincia=lecce",
-        "https://www.lavoro.gov.it/strumenti-e-servizi/collocamento-mirato",
+    fonti = [
+        # concorsipubblici.com — URL VERIFICATO, lista Lecce aggiornata
+        ("concorsipubblici.com",
+         "https://www.concorsipubblici.com/concorsi/regione/loc/lecce",
+         "https://www.concorsipubblici.com"),
+
+        # concorsando.it — URL VERIFICATO, lista Lecce non scaduti
+        ("Concorsando Lecce",
+         "https://www.concorsando.it/blog/concorsi-lecce/",
+         "https://www.concorsando.it"),
+
+        # concorsando — categorie protette nazionale
+        ("Concorsando Cat.Protette",
+         "https://www.concorsando.it/blog/?s=categorie+protette+puglia",
+         "https://www.concorsando.it"),
+
+        # concorsando — ASL Lecce 2026
+        ("Concorsando ASL Lecce",
+         "https://www.concorsando.it/blog/concorso-asl-lecce-a-tempo-determinato-2026/",
+         "https://www.concorsando.it"),
+
+        # concorsi.it — aggregatore con ASL Lecce
+        ("concorsi.it ASL Lecce",
+         "https://www.concorsi.it/ente/35707-azienda-sanitaria-locale-di-lecce.html",
+         "https://www.concorsi.it"),
     ]
 
-    for url in urls:
-        soup = get_soup(url, timeout=CONFIG["timeout_lento"])
+    for nome_fonte, url, base in fonti:
+        soup = get_soup(url, timeout=CONFIG["timeout_veloce"])
         if not soup:
             continue
-        for card in soup.select("article, .offerta, .card, li.risultato"):
-            testo = card.get_text(" ", strip=True)
-            link_el = card.select_one("a[href]")
-            titolo_el = card.select_one("h2, h3, .titolo, .title")
-            if not titolo_el:
-                continue
-            titolo = titolo_el.get_text(strip=True)[:200]
-            href = assoluto(link_el["href"] if link_el else "", url)
-            annunci.append(Annuncio(
-                titolo=titolo, fonte="LavoroPerTe",
-                url=href,
-                data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
-                descrizione=testo[:300], tipo="PA",
-                art16=rileva_art16(testo), art1=rileva_art1(testo),
-            ))
+        trovati = _estrai_annunci_da_soup(
+            soup, nome_fonte, "", base, solo_rilevanti=True
+        )
+        # per aggregatori filtra per rilevanza geografica o cat. protette
+        for a in trovati:
+            testo = a.titolo + " " + a.descrizione
+            if e_lecce(testo) or contiene(testo, KEYWORDS_TUTTE) or contiene(testo, ["puglia","salento","asl lecce","comune lecce"]):
+                annunci.append(a)
 
-    log.info(f"  → {len(annunci)} LavoroPerTe")
+    log.info(f"  → {len(annunci)} aggregatori")
     return annunci
 
 
@@ -979,11 +1063,30 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.commit()
     return conn
 
+def _data_scaduta(scadenza_str: str, giorni_tolleranza: int = 30) -> bool:
+    """Restituisce True se la scadenza è già passata da più di N giorni."""
+    if not scadenza_str:
+        return False
+    import re as _re2
+    # normalizza separatori
+    d = _re2.sub(r'[-.]', '/', scadenza_str.strip())
+    for fmt in ('%d/%m/%Y', '%Y/%m/%d', '%d/%m/%y'):
+        try:
+            dt = datetime.strptime(d[:10], fmt)
+            return dt < (datetime.now() - timedelta(days=giorni_tolleranza))
+        except ValueError:
+            continue
+    return False
+
 def filtra_nuovi(conn: sqlite3.Connection,
                  annunci: list[Annuncio]) -> list[Annuncio]:
     nuovi = []
     for a in annunci:
         if not a.url or len(a.url) < 5:
+            continue
+        # Scarta se la scadenza è già passata da oltre 30 giorni
+        if _data_scaduta(a.scadenza, giorni_tolleranza=30):
+            log.debug(f"Scaduto: {a.titolo[:50]} [{a.scadenza}]")
             continue
         row = conn.execute("SELECT 1 FROM annunci WHERE url=?",
                            (a.url,)).fetchone()
@@ -1379,7 +1482,7 @@ def main():
         scrape_provincia_lecce,
         scrape_concorsando,
         scrape_indeed,
-        scrape_lavoroperte,
+        scrape_aggregatori_lecce,
     ]
 
     grezzi = []
