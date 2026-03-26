@@ -1,54 +1,59 @@
-name: Cerca lavoro categorie protette Lecce
+name: Cerca Lavoro - Categorie Protette Lecce
 
 on:
-  workflow_dispatch:
   schedule:
-    # Ogni giorno alle 07:15 UTC
-    - cron: "15 7 * * *"
+    - cron: '0 7 * * *'   # 08:00 ora italiana
+  workflow_dispatch:
 
-permissions:
-  contents: read
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # Fix deprecation Node.js 20
 
 jobs:
-  run-script:
+  cerca-lavoro:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Installa dipendenze
+        run: pip install requests feedparser beautifulsoup4 lxml urllib3
 
-      - name: Run script
+      - name: Esegui ricerca
         env:
           EMAIL_DESTINATARIO: ${{ secrets.EMAIL_DESTINATARIO }}
-          EMAIL_MITTENTE: ${{ secrets.EMAIL_MITTENTE }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_MITTENTE:     ${{ secrets.EMAIL_MITTENTE }}
+          EMAIL_PASSWORD:     ${{ secrets.EMAIL_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python cerca_lavoro_categorie_protette.py
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python cerca_lavoro_categorie_protette.py
 
-      - name: Upload reports
+      - name: Salva artefatti
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: risultati-cerca-lavoro-lecce
+          name: risultati-${{ github.run_id }}
           path: |
-            risultati_lecce_v3.txt
-            risultati_lecce_v3.json
-            risultati_lecce_v3.html
-            lavoro_lecce_cp_v3.db
-            cerca_lavoro_v3.log
-          if-no-files-found: warn
-          retention-days: 14
+            risultati_lecce.html
+            risultati_lecce.txt
+            risultati_lecce.json
+            cerca_lavoro.log
+          retention-days: 60
+
+      - name: Aggiorna DB nel repo
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git add lavoro_lecce_cp.db risultati_lecce.txt risultati_lecce.json risultati_lecce.html || true
+          git diff --staged --quiet || git commit -m "Aggiornamento $(date '+%d/%m/%Y %H:%M')"
+          git push || true
