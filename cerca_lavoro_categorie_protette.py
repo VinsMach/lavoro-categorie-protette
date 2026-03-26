@@ -1,1530 +1,1246 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-=============================================================
-  CERCA LAVORO — CATEGORIE PROTETTE L.68/99
-  Provincia di Lecce + Puglia
-  Art. 1 (invalidità ≥46%) | Art. 16 (accesso diretto Puglia)
-=============================================================
-Fonti verificate e corrette:
-  - InPA (portale nazionale concorsi PA)
-  - Regione Puglia (URL reali verificati)
-  - ARPAL Puglia (SSL bypass, URL corretti)
-  - Gazzetta Ufficiale (RSS 3a serie speciale)
-  - Comune di Lecce
-  - Comuni provincia di Lecce (Galatina, Nardò, Gallipoli...)
-  - ASL Lecce
-  - Concorsando.it (aggregatore PA)
-  - Indeed / InfoJobs (privato)
-  - Portale Lavoro per Te (ANPAL)
-=============================================================
+CERCA LAVORO — CATEGORIE PROTETTE L.68/99
+Provincia di Lecce / Salento
+Art.16 (accesso diretto) + Art.1 (collocamento mirato)
+
+Architettura basata sulla revisione ChatGPT con correzioni:
+- SSL verify=False per siti PA con certificati problematici
+- URL ARPAL verificati
+- Aggregatori concorsipubblici.com + concorsi.it
+- Filtro geo obbligatorio (evita concorsi di Torino)
+- Score threshold abbassato + geo richiesto
+- too_old gestisce annunci senza data
 """
 
-import requests
-import feedparser
+from __future__ import annotations
+
+import html
 import json
-import os
-import time
-import smtplib
 import logging
-import urllib3
-from datetime import datetime, timedelta
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from bs4 import BeautifulSoup
-from dataclasses import dataclass, asdict, field
-from typing import Optional
+import os
+import re
+import smtplib
 import sqlite3
+import time
+import urllib3
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import Optional
+from urllib.parse import urljoin
 
-# Silenzia i warning SSL (necessari per siti PA con certificati problematici)
+import feedparser
+import requests
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Silenzia warning SSL — necessario per siti PA con certificati problematici
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ─────────────────────────────────────────────
-#  CONFIGURAZIONE
-# ─────────────────────────────────────────────
+
+# ============================================================
+# CONFIG
+# ============================================================
+
 CONFIG = {
-    # Email — in locale inserisci qui, su GitHub Actions usa i Secrets
+    "db_path":      "lavoro_lecce_cp.db",
+    "output_json":  "risultati_lecce.json",
+    "output_txt":   "risultati_lecce.txt",
+    "output_html":  "risultati_lecce.html",
+
+    "giorni_indietro": 120,
+    "giorni_tolleranza_scadenza": 7,
+    "timeout": 18,
+    "timeout_fast": 10,
+    "sleep": 1.0,
+    "max_dettagli": 50,
+
     "email_destinatario": os.getenv("EMAIL_DESTINATARIO", ""),
     "email_mittente":     os.getenv("EMAIL_MITTENTE", ""),
     "email_password":     os.getenv("EMAIL_PASSWORD", ""),
     "smtp_server": "smtp.gmail.com",
     "smtp_port": 587,
 
-    # Telegram (opzionale ma consigliato)
     "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
     "telegram_chat_id":   os.getenv("TELEGRAM_CHAT_ID", ""),
-
-    # File di output
-    "db_path":     "lavoro_lecce_cp.db",
-    "output_json": "risultati_lecce.json",
-    "output_txt":  "risultati_lecce.txt",
-
-    # Comportamento
-    "giorni_indietro": 60,        # aumentato per non perdere annunci
-    "pausa_tra_richieste": 1.5,
-    "timeout_veloce": 10,         # per siti veloci
-    "timeout_lento": 25,          # per siti PA lenti
 }
 
-# ─────────────────────────────────────────────
-#  PAROLE CHIAVE
-# ─────────────────────────────────────────────
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+}
 
-# Art. 16 = accesso diretto (riserva posti, niente graduatoria)
-KEYWORDS_ART16 = [
-    "articolo 16", "art. 16", "art.16",
-    "L.R. 17/2005", "legge regionale 17/2005",
-    "assunzione diretta disabili", "chiamata diretta",
-    "collocamento mirato chiamata nominativa",
-]
 
-# Art. 1 = iscritti liste L.68/99
-KEYWORDS_ART1 = [
+# ============================================================
+# PAROLE CHIAVE
+# ============================================================
+
+POSITIVE_CP = [
     "categorie protette", "categoria protetta",
-    "art. 1 legge 68", "articolo 1 l.68",
-    "l. 68/99", "legge 68/1999", "legge 68 99",
-    "collocamento mirato", "disabili riserva",
-    "riserva disabili", "invalidi civili",
-    "invalidità civile", "posto riservato disabili",
-    "art. 1 comma 1", "comma 3 art. 1 l.68",
+    "l.68/99", "l. 68/99", "legge 68/99", "legge 68/1999",
+    "collocamento mirato", "art. 1", "articolo 1",
+    "invalidità civile", "invalidita civile",
+    "disabilità", "disabilita", "disabili",
+    "riserva disabili", "posto riservato",
+    "liste speciali", "categorie di cui all'art. 1",
 ]
 
-KEYWORDS_TUTTE = KEYWORDS_ART16 + KEYWORDS_ART1
-
-# Filtro geografico stretto su Lecce
-KEYWORDS_LECCE = [
-    "lecce", "provincia di lecce", "leccese",
-    "salento", "galatina", "nardò", "gallipoli",
-    "maglie", "otranto", "tricase", "casarano",
-    "copertino", "galatone", "ugento",
+ART16_HINTS = [
+    "art. 16", "articolo 16", "chiamata nominativa",
+    "chiamata diretta", "avviamento a selezione", "accesso diretto",
+    "l.r. 17/2005", "lr 17/2005",
 ]
 
-# ─────────────────────────────────────────────
-#  STRUTTURA DATI
-# ─────────────────────────────────────────────
+# Parole geografiche della provincia di Lecce — OBBLIGATORIE per filtrare
+# concorsi da altre regioni (es. Torino, Milano)
+GEO_WORDS = [
+    "lecce", "salento", "provincia di lecce", "leccese",
+    "puglia", "apulia",
+    "casarano", "copertino", "gallipoli", "galatina", "nardò", "nardo",
+    "maglie", "otranto", "tricase", "ugento", "surbo", "taviano",
+    "racale", "galatone", "squinzano", "trepuzzi", "leverano",
+    "campi salentina", "monteroni", "novoli", "lequile",
+]
+
+BANDO_WORDS = [
+    "bando", "avviso pubblico", "concorso", "selezione pubblica",
+    "reclutamento", "assunzione", "manifestazione di interesse",
+]
+
+# Scarta queste pagine — sono risultati/atti, non annunci aperti
+NEGATIVE_WORDS = [
+    "graduatoria", "graduatorie", "elenco idonei",
+    "esito", "esiti", "ammessi", "non ammessi",
+    "convocazione", "convocazioni",
+    "verbale", "verbali",
+    "rettifica bando", "nomina commissione",
+    "tracce", "prova scritta", "prova orale",
+    "presa d'atto", "utilizzo graduatoria",
+    "assunti da altri enti", "interpello interno",
+    "mobilità interna", "mobilita interna",
+    "diario prova",
+]
+
+NAV_WORDS = [
+    "home", "privacy", "cookie", "accessibilità",
+    "mappa del sito", "newsletter",
+    "facebook", "instagram", "youtube", "linkedin",
+    "footer", "header", "vai al", "vai ai",
+    "accedi all'area", "albo pretorio",
+    "segnalazione disservizio", "prenotazione appuntamento",
+    "dichiarazione di accessibilità",
+]
+
+ITALIAN_MONTHS = {
+    "gennaio": 1, "febbraio": 2, "marzo": 3, "aprile": 4,
+    "maggio": 5, "giugno": 6, "luglio": 7, "agosto": 8,
+    "settembre": 9, "ottobre": 10, "novembre": 11, "dicembre": 12,
+}
+
+
+# ============================================================
+# ELENCO COMUNI (tutti i 96 comuni della provincia)
+# ============================================================
+
+COMUNI_LECCE = [
+    "Alessano", "Alezio", "Alliste", "Andrano", "Aradeo", "Arnesano",
+    "Bagnolo del Salento", "Botrugno", "Calimera", "Campi Salentina",
+    "Cannole", "Caprarica di Lecce", "Carmiano", "Carpignano Salentino",
+    "Casarano", "Castri di Lecce", "Castrignano de' Greci",
+    "Castrignano del Capo", "Castro", "Cavallino", "Collepasso",
+    "Copertino", "Corigliano d'Otranto", "Corsano", "Cursi",
+    "Cutrofiano", "Diso", "Gagliano del Capo", "Galatina", "Galatone",
+    "Gallipoli", "Giuggianello", "Giurdignano", "Guagnano",
+    "Lequile", "Leverano", "Lizzanello", "Maglie", "Martano",
+    "Martignano", "Matino", "Melendugno", "Melissano", "Melpignano",
+    "Miggiano", "Minervino di Lecce", "Monteroni di Lecce",
+    "Montesano Salentino", "Morciano di Leuca", "Muro Leccese", "Nardò",
+    "Neviano", "Nociglia", "Novoli", "Ortelle", "Otranto", "Palmariggi",
+    "Parabita", "Patù", "Poggiardo", "Porto Cesareo",
+    "Presicce-Acquarica", "Racale", "Ruffano", "Salice Salentino",
+    "Salve", "San Cassiano", "San Cesario di Lecce",
+    "San Donato di Lecce", "San Pietro in Lama", "Sanarica",
+    "Sannicola", "Santa Cesarea Terme", "Scorrano", "Seclì",
+    "Sogliano Cavour", "Soleto", "Specchia", "Spongano", "Squinzano",
+    "Sternatia", "Supersano", "Surano", "Surbo", "Taurisano",
+    "Taviano", "Tiggiano", "Trepuzzi", "Tricase", "Tuglie", "Ugento",
+    "Uggiano la Chiesa", "Veglie", "Vernole", "Zollino",
+]
+
+# Slug manuali per comuni con nomi complicati
+COMUNE_SLUG_MAP: dict[str, str] = {
+    "Nardò": "nardo",
+    "Castrignano de' Greci": "castrignanodegreci",
+    "Corigliano d'Otranto": "coriglianodotranto",
+    "Patù": "patu",
+    "Seclì": "secli",
+    "Presicce-Acquarica": "presicceacquarica",
+    "Santa Cesarea Terme": "santacesareaterme",
+    "Uggiano la Chiesa": "uggianolachiesa",
+    "San Cesario di Lecce": "sancesariodilecce",
+    "San Donato di Lecce": "sandonatodilecce",
+    "San Pietro in Lama": "sanpietroinlama",
+    "Bagnolo del Salento": "bagnolodelsalento",
+    "Campi Salentina": "campisalentina",
+    "Caprarica di Lecce": "capraricadilecce",
+    "Carpignano Salentino": "carpignanosalentino",
+    "Castri di Lecce": "castridilecce",
+    "Castrignano del Capo": "castrignanodelcapo",
+    "Gagliano del Capo": "gaglianodelcapo",
+    "Minervino di Lecce": "minervinodilecce",
+    "Monteroni di Lecce": "monteronidilecce",
+    "Montesano Salentino": "montesanosalentino",
+    "Morciano di Leuca": "morcianodileuca",
+    "Muro Leccese": "muroleccese",
+    "Porto Cesareo": "portocesareo",
+    "Salice Salentino": "salicesalentino",
+    "San Cassiano": "sancassiano",
+}
+
+# Enti fissi con URL verificati
+ENTI_SALENTO: list[dict] = [
+    {
+        "nome": "Comune di Lecce",
+        "fonte": "Comune di Lecce",
+        "ente": "Comune di Lecce",
+        "tipo": "PA",
+        "ssl": True,
+        "urls": [
+            "https://amministrazionetrasparente.comune.lecce.it/amministrazione-trasparente/bandi-di-concorso",
+            "https://www.comune.lecce.it/novita",
+        ],
+    },
+    {
+        "nome": "Provincia di Lecce",
+        "fonte": "Provincia di Lecce",
+        "ente": "Provincia di Lecce",
+        "tipo": "PA",
+        "ssl": False,
+        "urls": [
+            "https://www.provincia.le.it/categoria/selezioni-uniche/",
+            "https://www.provincia.le.it/concorsi-e-selezioni/",
+            "https://www.provincia.le.it/elenchi-di-idonei/",
+        ],
+    },
+    {
+        "nome": "ASL Lecce",
+        "fonte": "ASL Lecce",
+        "ente": "ASL Lecce",
+        "tipo": "PA",
+        "ssl": False,
+        # URL VERIFICATI dalla ricerca — ASL usa il portale regionale sanità
+        "urls": [
+            "https://www.sanita.puglia.it/web/asl-lecce/bandi-di-concorso",
+            "https://www.sanita.puglia.it/aol/listRepertorio?aziendaParam=asllecce",
+            "https://www.csselezioni.it/asl-lecce/",
+        ],
+    },
+    {
+        "nome": "Università del Salento",
+        "fonte": "Università del Salento",
+        "ente": "Università del Salento",
+        "tipo": "PA",
+        "ssl": True,
+        "urls": [
+            "https://trasparenza.unisalento.it/page/75/concorsi-attivi.html",
+            "https://trasparenza.unisalento.it/page/5/bandi-di-concorso.html",
+        ],
+    },
+    {
+        "nome": "ARPAL Puglia — Ambito Lecce",
+        "fonte": "ARPAL Puglia",
+        "ente": "ARPAL Puglia — Collocamento Mirato Lecce",
+        "tipo": "ARPAL",
+        "ssl": False,
+        # URL VERIFICATI dalla ricerca ufficiale ARPAL
+        "urls": [
+            "https://arpal.regione.puglia.it/servizi/persone/collocamento-mirato",
+            "https://arpal.regione.puglia.it/notizie",
+            "https://arpal.regione.puglia.it/",
+        ],
+    },
+    # Aggregatori con URL stabili e verificati — coprono tutti gli enti di Lecce
+    {
+        "nome": "concorsipubblici.com — Lecce",
+        "fonte": "concorsipubblici.com",
+        "ente": "",
+        "tipo": "AGGREGATORE",
+        "ssl": True,
+        "urls": [
+            "https://www.concorsipubblici.com/concorsi/regione/loc/lecce",
+        ],
+    },
+    {
+        "nome": "Concorsando — Lecce",
+        "fonte": "Concorsando.it",
+        "ente": "",
+        "tipo": "AGGREGATORE",
+        "ssl": True,
+        "urls": [
+            "https://www.concorsando.it/blog/concorsi-lecce/",
+            "https://www.concorsando.it/blog/?s=categorie+protette+puglia",
+        ],
+    },
+    {
+        "nome": "concorsi.it — ASL Lecce",
+        "fonte": "concorsi.it",
+        "ente": "",
+        "tipo": "AGGREGATORE",
+        "ssl": True,
+        "urls": [
+            "https://www.concorsi.it/ente/35707-azienda-sanitaria-locale-di-lecce.html",
+        ],
+    },
+]
+
+
+# ============================================================
+# MODEL
+# ============================================================
+
 @dataclass
 class Annuncio:
     titolo: str
     fonte: str
     url: str
-    data_pubblicazione: str
-    descrizione: str = ""        # snippet breve dalla lista
-    testo_completo: str = ""     # TESTO PIENO estratto dalla pagina dell'annuncio
+    data_pubblicazione: str = ""
+    descrizione: str = ""
+    testo_completo: str = ""
     ente: str = ""
-    scadenza: str = ""           # data scadenza estratta dal testo
-    posti: str = ""              # numero posti se trovato
-    tipo: str = ""               # "PA" | "Privato" | "ARPAL"
-    art16: bool = False          # accesso diretto — PRIORITARIO
-    art1: bool = False           # lista L.68/99
+    scadenza: str = ""
+    posti: str = ""
+    tipo: str = ""
+    art1: bool = False
+    art16: bool = False
+    score: int = 0
+    stato: str = ""
+    rilevante: bool = False
     dettaglio_scaricato: bool = False
-    trovato_il: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M"))
+    trovato_il: str = field(
+        default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
 
-# ─────────────────────────────────────────────
-#  LOGGER
-# ─────────────────────────────────────────────
+
+# ============================================================
+# LOGGING
+# ============================================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.FileHandler("cerca_lavoro.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+        logging.StreamHandler(),
+    ],
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("cerca_lavoro")
 
-# ─────────────────────────────────────────────
-#  SCARICA TESTO COMPLETO ANNUNCIO
-# ─────────────────────────────────────────────
-import re as _re
 
-def _estrai_scadenza(testo: str) -> str:
-    """Cerca date di scadenza nel testo (es. 'entro il 30/04/2026')."""
-    pattern = _re.compile(
-        r'(?:scad[ae]|entro[\s\w]+?|termine[\s\w]+?|presenta[a-z]+?[\s\w]+?)'
-        r'[\s:]*([0-3]?\d[/\-\.][01]?\d[/\-\.][12]\d{3})',
-        _re.IGNORECASE
+# ============================================================
+# HTTP — sessione con retry e SSL opzionale
+# ============================================================
+
+def build_session(verify_ssl: bool = True) -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=2, connect=2, read=2,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "HEAD"),
+        raise_on_status=False,
     )
-    m = pattern.search(testo)
-    if m:
-        return m.group(1)
-    # cerca comunque qualsiasi data
-    date_pattern = _re.compile(r'(?<![\d])(\d{1,2}[/\-\.]\d{1,2}[/\-\.]20\d{2})(?![\d])')
-    dates = date_pattern.findall(testo)
-    return dates[0] if dates else ""
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update(HEADERS)
+    session.verify = verify_ssl
+    return session
 
-def _estrai_posti(testo: str) -> str:
-    """Cerca 'n. X posti' o 'X unità' nel testo."""
-    pattern = _re.compile(
-        r'(?:n\.?\s*|numero\s+|n°\s*)'
-        r'(\d+)\s*(?:posti?|unit[àa]|figure?|posizioni?)',
-        _re.IGNORECASE
-    )
-    m = pattern.search(testo)
-    if m:
-        return m.group(1) + " posti"
-    m2 = _re.search(r'(\d+)\s*(?:posti?\s+a\s+tempo|posti?\s+di\s+ruolo|posti?\s+disponibili)',
-                    testo, _re.IGNORECASE)
-    if m2:
-        return m2.group(1) + " posti"
-    return ""
+# Due sessioni: una normale, una con SSL disabilitato per siti PA problematici
+SESSION      = build_session(verify_ssl=True)
+SESSION_NOSSL = build_session(verify_ssl=False)
 
-def _pulisci_testo(raw: str) -> str:
-    """Rimuove spazi eccessivi e righe vuote."""
-    linee = [l.strip() for l in raw.splitlines()]
-    linee = [l for l in linee if l and len(l) > 2]
-    # Rimuove duplicati consecutivi
-    result = []
-    prev = ""
-    for l in linee:
-        if l != prev:
-            result.append(l)
-        prev = l
-    return "\n".join(result)
 
-def scarica_dettaglio(annuncio: Annuncio, verify_ssl: bool = False) -> Annuncio:
-    """
-    Apre la pagina dell'annuncio e ne scarica il testo completo.
-    Aggiorna i campi: testo_completo, scadenza, posti, dettaglio_scaricato.
-    """
-    if not annuncio.url or annuncio.url.startswith("#") or len(annuncio.url) < 10:
-        return annuncio
-    if annuncio.dettaglio_scaricato:
-        return annuncio
+def _session(ssl: bool) -> requests.Session:
+    return SESSION if ssl else SESSION_NOSSL
 
+
+def sleep_polite(t: float = None):
+    time.sleep(t or CONFIG["sleep"])
+
+
+def get(url: str, timeout: int = None, ssl: bool = True) -> Optional[requests.Response]:
     try:
-        r = requests.get(
-            annuncio.url, headers=HEADERS,
-            timeout=CONFIG["timeout_lento"],
-            verify=verify_ssl
-        )
+        r = _session(ssl).get(url, timeout=timeout or CONFIG["timeout"])
         r.raise_for_status()
-        r.encoding = r.apparent_encoding or "utf-8"
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        # Rimuove elementi non informativi
-        for tag in soup.select("nav, header, footer, script, style, "
-                               ".menu, .sidebar, .cookie, .banner, "
-                               ".breadcrumb, #header, #footer, #nav"):
-            tag.decompose()
-
-        # Cerca il contenuto principale (ordine di priorità)
-        corpo = (
-            soup.select_one("article")
-            or soup.select_one("main")
-            or soup.select_one(".content, .contenuto, .entry-content, "
-                               ".page-content, .scheda, #content")
-            or soup.select_one("div[class*='concorso'], div[class*='bando'], "
-                               "div[class*='avviso']")
-            or soup.body
-        )
-
-        testo_raw = corpo.get_text(" ", strip=True) if corpo else ""
-        testo = _pulisci_testo(testo_raw)
-
-        # Limita a 4000 caratteri ma mantiene le parti più importanti
-        if len(testo) > 4000:
-            # Cerca sezioni chiave
-            sezioni = []
-            for kw in ["requisiti", "domanda", "scadenza", "posti",
-                       "categorie protette", "art. 1", "art. 16",
-                       "titolo di studio", "allegati", "modalità"]:
-                idx = testo.lower().find(kw)
-                if idx != -1:
-                    start = max(0, idx - 50)
-                    sezioni.append(testo[start:start + 600])
-            if sezioni:
-                testo = testo[:1500] + "\n\n[...SEZIONI CHIAVE...]\n\n" + "\n\n".join(sezioni[:4])
-            else:
-                testo = testo[:4000]
-
-        # Aggiorna l'annuncio
-        annuncio.testo_completo = testo
-        annuncio.dettaglio_scaricato = True
-
-        # Estrai scadenza e posti dal testo completo se non già trovati
-        testo_lower = testo.lower()
-        if not annuncio.scadenza:
-            annuncio.scadenza = _estrai_scadenza(testo)
-        if not annuncio.posti:
-            annuncio.posti = _estrai_posti(testo)
-
-        # Aggiorna flag art16/art1 se nel testo completo ci sono riferimenti
-        if not annuncio.art16:
-            annuncio.art16 = rileva_art16(testo)
-        if not annuncio.art1:
-            annuncio.art1 = rileva_art1(testo)
-
-        time.sleep(CONFIG["pausa_tra_richieste"])
-
+        if not r.encoding:
+            r.encoding = r.apparent_encoding or "utf-8"
+        sleep_polite()
+        return r
     except Exception as e:
-        log.debug(f"Dettaglio non scaricabile {annuncio.url}: {e}")
-
-    return annuncio
-
-def scarica_tutti_dettagli(annunci: list, max_annunci: int = 50) -> list:
-    """
-    Scarica il testo completo per tutti gli annunci (o i primi max_annunci).
-    Priorità agli Art.16, poi Art.1, poi gli altri.
-    """
-    # Ordina: prima art16, poi art1, poi il resto
-    ordinati = (
-        [a for a in annunci if a.art16] +
-        [a for a in annunci if a.art1 and not a.art16] +
-        [a for a in annunci if not a.art1 and not a.art16]
-    )
-
-    # Filtra prima gli annunci che sono chiaramente link di navigazione
-    TITOLI_NAV = {"home", "accedi all'area personale", "vai al footer",
-                  "vai ai contenuti", "informativa privacy", "note legali",
-                  "dichiarazione di accessibilità", "albo pretorio",
-                  "amministrazione trasparente", "segnalazione disservizio",
-                  "prenotazione appuntamento", "richiesta assistenza",
-                  "piano di miglioramento", "regione puglia", "città di otranto",
-                  "vivere il comune", "discover otranto", "gestione rifiuti",
-                  "comunicati", "anagrafe e stato civile", "atti e documenti",
-                  "in primo piano", "organi di governo", "aree amministrative",
-                  "personale amministrativo", "documenti e dati", "autorizzazioni",
-                  "urp - sportello", "leggi le faq"}
-    ordinati = [a for a in ordinati
-                if a.titolo.lower().strip() not in TITOLI_NAV
-                and len(a.titolo.strip()) >= 20
-                and not a.titolo.lower().startswith(("vai ", "accedi ", "skip "))]
-
-    log.info(f"⬇️  Scarico dettagli per {min(len(ordinati), max_annunci)} annunci...")
-    for i, ann in enumerate(ordinati[:max_annunci]):
-        log.info(f"  [{i+1}/{min(len(ordinati), max_annunci)}] {ann.titolo[:55]}...")
-        # SSL verify=False per siti PA con certificati problematici
-        verify = ann.url.startswith("https://www.inpa") or ann.url.startswith("https://www.comune")
-        scarica_dettaglio(ann, verify_ssl=verify)
-
-    return annunci
-
-
-# ─────────────────────────────────────────────
-#  HELPERS HTTP
-# ─────────────────────────────────────────────
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "it-IT,it;q=0.9,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate",
-}
-
-def get_soup(url: str, timeout: int = None, verify_ssl: bool = True,
-             params: dict = None) -> Optional[BeautifulSoup]:
-    """Scarica pagina HTML → BeautifulSoup. SSL opzionale per siti PA."""
-    t = timeout or CONFIG["timeout_lento"]
-    try:
-        r = requests.get(url, params=params, headers=HEADERS,
-                         timeout=t, verify=verify_ssl)
-        r.raise_for_status()
-        r.encoding = r.apparent_encoding or "utf-8"
-        time.sleep(CONFIG["pausa_tra_richieste"])
-        return BeautifulSoup(r.text, "html.parser")
-    except Exception as e:
-        log.warning(f"Errore GET {url}: {e}")
+        log.warning(f"GET {url} → {e}")
         return None
 
-def get_json_api(url: str, params: dict = None,
-                 verify_ssl: bool = True) -> Optional[dict | list]:
-    """Scarica JSON da API pubblica."""
-    try:
-        r = requests.get(url, params=params, headers=HEADERS,
-                         timeout=CONFIG["timeout_lento"], verify=verify_ssl)
-        r.raise_for_status()
-        time.sleep(CONFIG["pausa_tra_richieste"])
-        return r.json()
-    except Exception as e:
-        log.warning(f"Errore JSON {url}: {e}")
-        return None
+
+def get_soup(url: str, timeout: int = None, ssl: bool = True) -> Optional[BeautifulSoup]:
+    r = get(url, timeout=timeout, ssl=ssl)
+    return BeautifulSoup(r.text, "html.parser") if r else None
+
 
 def assoluto(href: str, base: str) -> str:
-    """Trasforma URL relativo in assoluto."""
-    if not href:
+    return urljoin(base, href) if href else ""
+
+
+# ============================================================
+# HELPERS TESTO
+# ============================================================
+
+def norm(text: str) -> str:
+    if not text:
         return ""
-    if href.startswith("http"):
-        return href
-    from urllib.parse import urljoin
-    return urljoin(base, href)
-
-def contiene(testo: str, keywords: list) -> bool:
-    t = testo.lower()
-    return any(k.lower() in t for k in keywords)
-
-def e_lecce(testo: str) -> bool:
-    return contiene(testo, KEYWORDS_LECCE)
-
-def rileva_art16(testo: str) -> bool:
-    return contiene(testo, KEYWORDS_ART16)
-
-def rileva_art1(testo: str) -> bool:
-    return contiene(testo, KEYWORDS_ART1)
-
-def e_rilevante(testo: str) -> bool:
-    """Annuncio rilevante = (Lecce O PA/ARPAL generica) + categoria protetta"""
-    return contiene(testo, KEYWORDS_TUTTE) or e_lecce(testo)
-
-# ─────────────────────────────────────────────────────────────
-#  FONTE 1: InPA — API REST ufficiale
-#  https://www.inpa.gov.it  (portale nazionale reclutamento PA)
-# ─────────────────────────────────────────────────────────────
-def scrape_inpa() -> list[Annuncio]:
-    log.info("📋 InPA — API concorsi PA...")
-    annunci = []
-
-    # API pubblica InPA - endpoint bandi
-    queries = [
-        "categorie protette lecce",
-        "collocamento mirato lecce",
-        "disabili puglia concorso",
-        "articolo 1 legge 68 lecce",
-    ]
-
-    for q in queries:
-        # Endpoint API REST di InPA
-        data = get_json_api(
-            "https://www.inpa.gov.it/wp-json/wp/v2/posts",
-            params={"search": q, "per_page": 20,
-                    "_fields": "title,link,date,excerpt"}
-        )
-        if not data:
-            continue
-        for item in (data if isinstance(data, list) else []):
-            titolo = BeautifulSoup(
-                item.get("title", {}).get("rendered", ""), "html.parser"
-            ).get_text(strip=True)
-            descr = BeautifulSoup(
-                item.get("excerpt", {}).get("rendered", ""), "html.parser"
-            ).get_text(strip=True)
-            url = item.get("link", "")
-            testo = titolo + " " + descr
-
-            annunci.append(Annuncio(
-                titolo=titolo, fonte="InPA", url=url,
-                data_pubblicazione=item.get("date", "")[:10],
-                descrizione=descr[:300], tipo="PA",
-                art16=rileva_art16(testo), art1=rileva_art1(testo),
-            ))
-
-    # Scraping pagina bandi con filtro Puglia/Lecce
-    for path in [
-        "/bandi/?regione=puglia",
-        "/concorsi-pubblici/?area_geografica=puglia",
-        "/bandi/",
-    ]:
-        soup = get_soup("https://www.inpa.gov.it" + path)
-        if not soup:
-            continue
-        for card in soup.select("article, .bando-card, .job-card, li.bando"):
-            testo_card = card.get_text(" ", strip=True)
-            if not e_rilevante(testo_card):
-                continue
-            titolo_el = card.select_one("h2, h3, .title, a")
-            link_el = card.select_one("a[href]")
-            if not titolo_el:
-                continue
-            annunci.append(Annuncio(
-                titolo=titolo_el.get_text(strip=True)[:200],
-                fonte="InPA", tipo="PA",
-                url=assoluto(link_el["href"] if link_el else "", "https://www.inpa.gov.it"),
-                data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
-                descrizione=testo_card[:300],
-                art16=rileva_art16(testo_card), art1=rileva_art1(testo_card),
-            ))
-        break
-
-    log.info(f"  → {len(annunci)} InPA")
-    return annunci
+    text = html.unescape(text).replace("\xa0", " ")
+    return re.sub(r"\s+", " ", text).strip()
 
 
-# ─────────────────────────────────────────────────────────────
-#  FONTE 2: Regione Puglia — URL reali verificati 2025/2026
-# ─────────────────────────────────────────────────────────────
-def scrape_regione_puglia() -> list[Annuncio]:
-    log.info("🏛️  Regione Puglia...")
-    annunci = []
-    BASE = "https://www.regione.puglia.it"
+def slugify_comune(nome: str) -> str:
+    if nome in COMUNE_SLUG_MAP:
+        return COMUNE_SLUG_MAP[nome]
+    s = nome.lower().strip()
+    for old, new in {"à":"a","è":"e","é":"e","ì":"i","ò":"o","ù":"u","'":"","'":"","-":"","'":"","'":""," ":""}.items():
+        s = s.replace(old, new)
+    return re.sub(r"[^a-z0-9]", "", s)
 
-    # URL reali verificati (il vecchio /web/lavoro/ non esiste più)
-    urls_reali = [
-        f"{BASE}/web/guest/search?query=concorso+categorie+protette",
-        f"{BASE}/web/guest/search?query=collocamento+mirato+lecce",
-        f"{BASE}/documents/10180/0/bandi_concorso",
-        # Sezione trasparenza - URL stabile
-        f"{BASE}/web/trasparenza/bandi-di-concorso",
-        f"{BASE}/web/lavoro",
-        f"{BASE}/web/arpal",
-    ]
 
-    for url in urls_reali:
-        soup = get_soup(url)
-        if not soup:
-            continue
-        for link in soup.select("a[href]"):
-            href = link.get("href", "")
-            testo = link.get_text(strip=True)
-            if len(testo) < 10:
-                continue
-            testo_full = testo + " " + href
-            if not (contiene(testo_full, ["concorso", "bando", "avviso", "selezione",
-                                           "assunzione", "collocamento", "disabil"]) ):
-                continue
-            annunci.append(Annuncio(
-                titolo=testo[:200], fonte="Regione Puglia",
-                url=assoluto(href, BASE),
-                data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
-                ente="Regione Puglia", tipo="PA",
-                art16=rileva_art16(testo_full), art1=rileva_art1(testo_full),
-            ))
+def contains_any(text: str, words: list[str]) -> bool:
+    low = norm(text).lower()
+    return any(w.lower() in low for w in words)
 
-    # RSS ufficiale Regione Puglia
-    for rss_url in [
-        "https://www.regione.puglia.it/rss/news",
-        "https://www.regione.puglia.it/rss/bandi",
-        "https://www.regione.puglia.it/rss/lavoro",
-    ]:
+
+def geo_match(text: str)  -> bool: return contains_any(text, GEO_WORDS)
+def cp_match(text: str)   -> bool: return contains_any(text, POSITIVE_CP)
+def art16_match(text: str)-> bool: return contains_any(text, ART16_HINTS)
+def bando_match(text: str)-> bool: return contains_any(text, BANDO_WORDS)
+def neg_match(text: str)  -> bool: return contains_any(text, NEGATIVE_WORDS)
+def nav_match(text: str)  -> bool: return contains_any(text, NAV_WORDS)
+
+
+def extract_dates(text: str) -> list[str]:
+    out = []
+    for m in re.finditer(r"\b([0-3]?\d)[/\-.]([01]?\d)[/\-.](20\d{2})\b", text):
+        dd, mm, yyyy = m.groups()
         try:
-            feed = feedparser.parse(rss_url)
-            for entry in feed.entries[:30]:
-                titolo = entry.get("title", "")
-                descr = entry.get("summary", "")
-                testo = titolo + " " + descr
-                if not (contiene(testo, ["concorso", "bando", "collocamento",
-                                          "disabili", "categorie protette"])):
-                    continue
-                annunci.append(Annuncio(
-                    titolo=titolo, fonte="Regione Puglia RSS",
-                    url=entry.get("link", ""),
-                    data_pubblicazione=entry.get("published", "")[:10],
-                    descrizione=descr[:300], ente="Regione Puglia", tipo="PA",
-                    art16=rileva_art16(testo), art1=rileva_art1(testo),
-                ))
-        except Exception as e:
-            log.warning(f"RSS Regione Puglia {rss_url}: {e}")
-
-    log.info(f"  → {len(annunci)} Regione Puglia")
-    return annunci
-
-
-# ─────────────────────────────────────────────────────────────
-#  FONTE 3: ARPAL Puglia — SSL verify=False (cert hostname mismatch)
-#  https://arpal.regione.puglia.it  (senza www!)
-# ─────────────────────────────────────────────────────────────
-def scrape_arpal() -> list[Annuncio]:
-    log.info("♿ ARPAL Puglia (collocamento mirato)...")
-    annunci = []
-
-    # Il certificato è valido per arpal.regione.puglia.it (senza www)
-    BASE = "https://arpal.regione.puglia.it"
-
-    urls_arpal = [
-        f"{BASE}/avvisi-e-bandi/",
-        f"{BASE}/collocamento-mirato/",
-        f"{BASE}/collocamento-mirato/chiamata-con-avviso/",
-        f"{BASE}/collocamento-mirato/chiamata-nominativa/",    # Art.16
-        f"{BASE}/opportunita-di-lavoro/",
-        f"{BASE}/news/",
-        f"{BASE}/",
-    ]
-
-    for url in urls_arpal:
-        # SSL verify=False perché il cert ha hostname mismatch (bug del sito PA)
-        soup = get_soup(url, verify_ssl=False)
-        if not soup:
-            continue
-        for item in soup.select("article, .entry, h2 a, h3 a, .bando, li.news-item"):
-            testo = item.get_text(" ", strip=True)
-            link_el = item.select_one("a[href]") or (item if item.name == "a" else None)
-            if not link_el or len(testo) < 10:
-                continue
-            titolo = link_el.get_text(strip=True) or testo[:100]
-            href = assoluto(link_el.get("href", ""), BASE)
-
-            annunci.append(Annuncio(
-                titolo=titolo[:200], fonte="ARPAL Puglia",
-                url=href,
-                data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
-                descrizione=testo[:300], ente="ARPAL Puglia", tipo="ARPAL",
-                # ARPAL = per definizione collocamento mirato
-                art16=rileva_art16(testo) or "nominativ" in testo.lower(),
-                art1=True,
-            ))
-
-    # CPI Lecce specifico
-    cpi_lecce_urls = [
-        f"{BASE}/centri-per-limpiego/lecce/",
-        f"{BASE}/cpi/lecce/",
-        "https://arpal.regione.puglia.it/offerte-di-lavoro/?cpi=lecce",
-    ]
-    for url in cpi_lecce_urls:
-        soup = get_soup(url, verify_ssl=False)
-        if not soup:
-            continue
-        for link in soup.select("a[href]"):
-            testo = link.get_text(strip=True)
-            if len(testo) < 15:
-                continue
-            if contiene(testo, ["offerta", "avviso", "bando", "selezione",
-                                  "disabil", "categorie", "collocamento"]):
-                annunci.append(Annuncio(
-                    titolo=testo[:200], fonte="CPI Lecce",
-                    url=assoluto(link["href"], BASE),
-                    data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
-                    ente="CPI Lecce", tipo="ARPAL", art16=False, art1=True,
-                ))
-
-    log.info(f"  → {len(annunci)} ARPAL/CPI")
-    return annunci
-
-
-# ─────────────────────────────────────────────────────────────
-#  FONTE 4: Gazzetta Ufficiale — RSS 3a serie speciale (concorsi)
-# ─────────────────────────────────────────────────────────────
-def scrape_gazzetta_ufficiale() -> list[Annuncio]:
-    log.info("📰 Gazzetta Ufficiale (3a serie concorsi)...")
-    annunci = []
-
-    # RSS serie speciale concorsi ed esami
-    rss_urls = [
-        "https://www.gazzettaufficiale.it/rss/concorsi.xml",
-        "https://www.gazzettaufficiale.it/rss/esecutivi.xml",
-    ]
-
-    for rss_url in rss_urls:
+            out.append(datetime(int(yyyy), int(mm), int(dd)).strftime("%Y-%m-%d"))
+        except ValueError:
+            pass
+    for m in re.finditer(
+        r"\b([0-3]?\d)\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)\s+(20\d{2})\b",
+        text.lower()
+    ):
+        dd, mese, yyyy = m.groups()
         try:
-            feed = feedparser.parse(rss_url)
-            for entry in feed.entries[:50]:
-                titolo = entry.get("title", "")
-                descr  = entry.get("summary", "")
-                testo  = titolo + " " + descr
-                # Includi se: Lecce/Puglia O categorie protette
-                if not (e_lecce(testo) or contiene(testo, KEYWORDS_TUTTE)):
-                    continue
-                annunci.append(Annuncio(
-                    titolo=titolo, fonte="Gazzetta Ufficiale",
-                    url=entry.get("link", ""),
-                    data_pubblicazione=entry.get("published", "")[:10],
-                    descrizione=descr[:300], tipo="PA",
-                    art16=rileva_art16(testo), art1=rileva_art1(testo),
-                ))
-        except Exception as e:
-            log.warning(f"RSS GU {rss_url}: {e}")
+            out.append(datetime(int(yyyy), ITALIAN_MONTHS[mese], int(dd)).strftime("%Y-%m-%d"))
+        except ValueError:
+            pass
+    return list(dict.fromkeys(out))
 
-    # Ricerca testuale sul sito GU
-    for query in [
-        "categorie protette lecce",
-        "collocamento mirato puglia",
-        "articolo 16 disabili puglia",
+
+def extract_first_date(text: str) -> str:
+    d = extract_dates(text)
+    return d[0] if d else ""
+
+
+def extract_scadenza(text: str) -> str:
+    patterns = [
+        r"(?:scadenza|termine(?:\s+di)?\s+presentazione|entro(?:\s+il)?)[:\s]+([0-3]?\d[/\-.][01]?\d[/\-.]20\d{2})",
+        r"(?:scadenza|termine(?:\s+di)?\s+presentazione|entro(?:\s+il)?)[:\s]+([0-3]?\d\s+(?:gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)\s+20\d{2})",
+        r"(?:data chiusura candidature)[:\s]+([0-3]?\d\s+(?:gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)\s+20\d{2})",
+    ]
+    for p in patterns:
+        m = re.search(p, text.lower(), flags=re.IGNORECASE)
+        if m:
+            return extract_first_date(m.group(1))
+    return ""
+
+
+def extract_posti(text: str) -> str:
+    for p in [
+        r"\b(?:n\.?|nr\.?|numero)\s*(\d+)\s*(?:posti?|unità|unita)\b",
+        r"\b(\d+)\s*(?:posti?|unità|unita)\b",
     ]:
-        soup = get_soup(
-            "https://www.gazzettaufficiale.it/ricerca/concorsi",
-            params={"q": query, "tipoSerie": "concorsi"}
-        )
-        if not soup:
-            continue
-        for row in soup.select("tr, .risultato, article"):
-            testo = row.get_text(" ", strip=True)
-            link_el = row.select_one("a[href]")
-            if not link_el or len(testo) < 20:
-                continue
-            if not (e_lecce(testo) or contiene(testo, KEYWORDS_TUTTE)):
-                continue
-            annunci.append(Annuncio(
-                titolo=link_el.get_text(strip=True)[:200],
-                fonte="Gazzetta Ufficiale", tipo="PA",
-                url=assoluto(link_el["href"], "https://www.gazzettaufficiale.it"),
-                data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
-                descrizione=testo[:300],
-                art16=rileva_art16(testo), art1=rileva_art1(testo),
-            ))
-
-    log.info(f"  → {len(annunci)} Gazzetta Ufficiale")
-    return annunci
+        m = re.search(p, text.lower())
+        if m:
+            return f"{m.group(1)} posti"
+    return ""
 
 
-# ─────────────────────────────────────────────────────────────
-#  FONTE 5: Comune di Lecce — URL reali verificati
-# ─────────────────────────────────────────────────────────────
-def _estrai_annunci_da_soup(soup: BeautifulSoup, fonte: str,
-                            ente: str, base_url: str,
-                            solo_rilevanti: bool = False) -> list[Annuncio]:
+def parse_date_iso(s: str) -> Optional[datetime]:
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def expired(scadenza: str) -> bool:
+    dt = parse_date_iso(scadenza)
+    return bool(dt and dt < datetime.now() - timedelta(days=CONFIG["giorni_tolleranza_scadenza"]))
+
+
+def too_old(data_pub: str) -> bool:
     """
-    Estrae annunci da una pagina già scaricata.
-    Cerca link che abbiano testo significativo e puntino a pagine interne.
-    solo_rilevanti=True → filtra solo annunci con keyword concorso/bando/selezione.
+    FIX v5: se data_pubblicazione è vuota NON scartare —
+    molti annunci PA non hanno data ed è meglio tenerli che perderli.
     """
-    risultati = []
-    # Selettori in ordine di specificità
-    selettori = [
-        "article", "li.bando", "li.concorso", "tr",
-        "div.item", "div.notizia", ".entry", ".card",
-        # fallback: tutti i link con testo sufficientemente lungo
-        "a[href]",
-    ]
-    visti = set()
-    for sel in selettori:
-        for el in soup.select(sel):
-            link_el = el if el.name == "a" else el.select_one("a[href]")
-            if not link_el:
-                continue
-            href = link_el.get("href", "")
-            if not href or href in visti or href.startswith("#"):
-                continue
-            visti.add(href)
-            titolo = link_el.get_text(strip=True)
-            testo_ctx = el.get_text(" ", strip=True)
-            # Filtra link di navigazione (troppo corti o generici)
-            if len(titolo) < 15:
-                continue
-            parole_nav = {"home","cookie","privacy","accessibilità","contatti",
-                          "albo pretorio","mappa del sito","footer","header",
-                          "vai al","vai ai","accedi","registrati","logout",
-                          "facebook","twitter","instagram","youtube",
-                          "segnalazione","newsletter","pec","mail","email",
-                          "informativa","nota legale","dichiarazione","prenotaz"}
-            if titolo.lower().strip() in parole_nav:
-                continue
-            if any(titolo.lower().startswith(p) for p in parole_nav):
-                continue
-            if solo_rilevanti:
-                kw_ann = ["concorso","bando","selezione","avviso","assunzione",
-                          "reclutamento","mobilità","stabilizzazione","posto",
-                          "istruttore","funzionario","collaboratore","operatore",
-                          "tecnico","dirigente","graduatoria","categoria protetta",
-                          "disabil","collocamento","art. 1","art. 16"]
-                if not contiene(titolo + " " + testo_ctx, kw_ann):
-                    continue
-            href_abs = assoluto(href, base_url)
-            risultati.append(Annuncio(
-                titolo=titolo[:200], fonte=fonte, url=href_abs,
-                data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
-                descrizione=testo_ctx[:300], ente=ente, tipo="PA",
-                art16=rileva_art16(titolo + testo_ctx),
-                art1=rileva_art1(titolo + testo_ctx),
-            ))
-    return risultati
+    if not data_pub:
+        return False
+    dt = parse_date_iso(data_pub)
+    return bool(dt and dt < datetime.now() - timedelta(days=CONFIG["giorni_indietro"]))
 
 
-def scrape_comune_lecce() -> list[Annuncio]:
-    log.info("🏙️  Comune di Lecce...")
-    annunci = []
-
-    # Il sito del comune usa un SOTTODOMINIO separato per la trasparenza
-    TRASPARENZA = "https://amministrazionetrasparente.comune.lecce.it"
-    BASE = "https://www.comune.lecce.it"
-
-    urls_prioritari = [
-        # Sottodominio trasparenza — URL VERIFICATO dalla ricerca
-        f"{TRASPARENZA}/amministrazione-trasparente/bandi-di-concorso",
-        f"{TRASPARENZA}/amministrazione-trasparente/bandi-di-concorso/graduatorie-ancora-vigenti-e-assunzioni-effettuate",
-        # Sito principale — sezione notizie concorsi
-        f"{BASE}/news?categoria=concorsi",
-        f"{BASE}/aree-tematiche/lavoro",
-        f"{BASE}/aree-tematiche/uffici-comunali/ufficio-concorsi",
-    ]
-
-    for url in urls_prioritari:
-        soup = get_soup(url, timeout=CONFIG["timeout_lento"], verify_ssl=True)
-        if not soup:
-            continue
-        trovati = _estrai_annunci_da_soup(
-            soup, "Comune di Lecce", "Comune di Lecce",
-            TRASPARENZA if "amministrazionetrasparente" in url else BASE,
-            solo_rilevanti=True
-        )
-        annunci.extend(trovati)
-        if trovati:
-            log.debug(f"  Lecce: {len(trovati)} da {url}")
-
-    log.info(f"  → {len(annunci)} Comune Lecce")
-    return annunci
+def clean_page_text(soup: BeautifulSoup) -> str:
+    for tag in soup.select("script,style,nav,footer,header,noscript,iframe,.cookie,.menu"):
+        tag.decompose()
+    main = (
+        soup.select_one("main") or soup.select_one("article")
+        or soup.select_one(".content") or soup.select_one(".entry-content")
+        or soup.select_one(".page-content") or soup.body
+    )
+    if not main:
+        return ""
+    raw = main.get_text("\n", strip=True)
+    lines, prev = [], None
+    for line in [norm(x) for x in raw.splitlines()]:
+        if len(line) >= 3 and line != prev:
+            lines.append(line)
+        prev = line
+    return "\n".join(lines)[:10_000]
 
 
-# ─────────────────────────────────────────────────────────────
-#  FONTE 6: Comuni provincia di Lecce
-# ─────────────────────────────────────────────────────────────
-# Comuni provincia di Lecce — codice catastale per il sottodominio trasparenza
-# Schema URL: https://amministrazionetrasparente.comune.NOME.le.it/
-# oppure: https://www.comune.NOME.le.it/amministrazione-trasparente/bandi-di-concorso
-COMUNI_LECCE = {
-    "Galatina":   ("L049", "galatina"),
-    "Nardò":      ("F842", "nardo"),
-    "Gallipoli":  ("D883", "gallipoli"),
-    "Maglie":     ("E815", "maglie"),
-    "Tricase":    ("L419", "tricase"),
-    "Casarano":   ("B978", "casarano"),
-    "Copertino":  ("C978", "copertino"),
-    "Galatone":   ("D882", "galatone"),
-    "Ugento":     ("L484", "ugento"),
-    "Otranto":    ("G188", "otranto"),
-    "Alessano":   ("A184", "alessano"),
-    "Campi Salentina": ("B506", "campisalentina"),
-    "Squinzano":  ("I930", "squinzano"),
-    "Leverano":   ("E563", "leverano"),
-}
-
-def _url_comuni_da_provare(slug: str) -> list[str]:
-    """Genera lista URL da provare per un comune, dal più probabile al meno."""
-    base_www = f"https://www.comune.{slug}.le.it"
-    base_at  = f"https://amministrazionetrasparente.comune.{slug}.le.it"
-    return [
-        # Sottodominio trasparenza (standard moderno)
-        f"{base_at}/amministrazione-trasparente/bandi-di-concorso",
-        f"{base_at}/bandi-di-concorso",
-        # Sito principale con path trasparenza
-        f"{base_www}/amministrazione-trasparente/personale/selezione-del-personale",
-        f"{base_www}/it/amministrazione-trasparente/bandi-di-concorso",
-        # Path semplice
-        f"{base_www}/bandi-concorso",
-        f"{base_www}/concorsi-pubblici",
-    ]
-
-def scrape_comuni_lecce() -> list[Annuncio]:
-    log.info("🏘️  Comuni provincia di Lecce (sottodomini trasparenza)...")
-    annunci = []
-
-    for nome, (cod, slug) in COMUNI_LECCE.items():
-        for url in _url_comuni_da_provare(slug):
-            soup = get_soup(url, timeout=12, verify_ssl=False)
-            if not soup:
-                continue
-            trovati = _estrai_annunci_da_soup(
-                soup, f"Comune {nome}", f"Comune di {nome}",
-                url, solo_rilevanti=True
-            )
-            if trovati:
-                annunci.extend(trovati)
-                log.debug(f"  {nome}: {len(trovati)} annunci da {url}")
-                break  # URL funzionante trovato per questo comune
-
-    log.info(f"  → {len(annunci)} Comuni provincia LE")
-    return annunci
+def looks_like_attachment(url: str) -> bool:
+    return any(url.lower().endswith(e) for e in [".pdf",".doc",".docx",".zip",".odt"])
 
 
-# ─────────────────────────────────────────────────────────────
-#  FONTE 7: ASL Lecce
-#  https://www.asl.lecce.it
-# ─────────────────────────────────────────────────────────────
-def scrape_asl_lecce() -> list[Annuncio]:
-    log.info("🏥 ASL Lecce...")
-    annunci = []
-    BASE = "https://www.asl.lecce.it"
+# ============================================================
+# SCORING
+# ============================================================
 
-    urls_asl = [
-        f"{BASE}/asl-lecce/concorsi-e-selezioni/",
-        f"{BASE}/concorsi",
-        f"{BASE}/lavora-con-noi",
-        f"{BASE}/bandi-di-concorso",
-        f"{BASE}/it/concorsi-selezioni",
-        # Amministrazione trasparente (standard PA)
-        f"{BASE}/amministrazione-trasparente/bandi-di-concorso",
-    ]
+def score_annuncio(a: Annuncio) -> int:
+    text = " ".join([a.titolo, a.descrizione, a.testo_completo, a.ente, a.fonte, a.url])
+    low = text.lower()
 
-    for url in urls_asl:
-        soup = get_soup(url, verify_ssl=False)
-        if not soup:
-            continue
-        for item in soup.select("article, li, tr, .entry"):
-            testo = item.get_text(" ", strip=True)
-            link_el = item.select_one("a[href]")
-            titolo_el = item.select_one("h2, h3, h4, a, .title")
-            if not titolo_el or len(testo) < 10:
-                continue
-            titolo = titolo_el.get_text(strip=True)[:200]
-            href = assoluto(link_el["href"] if link_el else "", BASE)
-            annunci.append(Annuncio(
-                titolo=titolo, fonte="ASL Lecce",
-                url=href,
-                data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
-                descrizione=testo[:300], ente="ASL Lecce", tipo="PA",
-                art16=rileva_art16(testo), art1=rileva_art1(testo),
-            ))
-        if annunci:
-            break  # primo URL che funziona
+    if nav_match(low):   return -100
+    if neg_match(low):   return -90
 
-    log.info(f"  → {len(annunci)} ASL Lecce")
-    return annunci
+    score = 0
+    if cp_match(low):    score += 12
+    if art16_match(low): score += 8
+    if bando_match(low): score += 4
+    if geo_match(low):   score += 4   # FIX v5: +4 invece di +3 (peso geografico aumentato)
+    if "lecce" in low:   score += 3   # FIX v5: bonus extra per Lecce specifica
+    if a.tipo == "ARPAL": score += 2
+    if "aperto" in low:  score += 3
+    if "chiuso" in low:  score -= 4
+
+    return score
 
 
-# ─────────────────────────────────────────────────────────────
-#  FONTE 8: Provincia di Lecce
-# ─────────────────────────────────────────────────────────────
-def scrape_provincia_lecce() -> list[Annuncio]:
-    log.info("🏛️  Provincia di Lecce...")
-    annunci = []
-    BASE = "https://www.provincia.le.it"
-
-    for url in [
-        f"{BASE}/il-territorio/lavora-con-noi/concorsi-e-avvisi/",
-        f"{BASE}/concorsi",
-        f"{BASE}/bandi",
-        f"{BASE}/lavora-con-noi",
-        f"{BASE}/amministrazione-trasparente/bandi-di-concorso",
-    ]:
-        soup = get_soup(url, verify_ssl=False)
-        if not soup:
-            continue
-        for item in soup.select("article, li, .entry, tr"):
-            testo = item.get_text(" ", strip=True)
-            link_el = item.select_one("a[href]")
-            if not link_el or len(testo) < 10:
-                continue
-            href = assoluto(link_el["href"], BASE)
-            titolo = link_el.get_text(strip=True)[:200]
-            annunci.append(Annuncio(
-                titolo=titolo, fonte="Provincia di Lecce",
-                url=href,
-                data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
-                ente="Provincia di Lecce", tipo="PA",
-                art16=rileva_art16(testo), art1=rileva_art1(testo),
-            ))
-        if annunci:
-            break
-
-    log.info(f"  → {len(annunci)} Provincia Lecce")
-    return annunci
+def finalize(a: Annuncio) -> Annuncio:
+    text = " ".join([a.titolo, a.descrizione, a.testo_completo, a.url, a.ente, a.fonte])
+    if not a.data_pubblicazione:
+        a.data_pubblicazione = extract_first_date(text)
+    if not a.scadenza:
+        a.scadenza = extract_scadenza(text)
+    if not a.posti:
+        a.posti = extract_posti(text)
+    if not a.art1:
+        a.art1 = cp_match(text)
+    if not a.art16:
+        a.art16 = art16_match(text)
+    low = text.lower()
+    if "stato: aperto" in low:
+        a.stato = "Aperto"
+    elif "stato: chiuso" in low:
+        a.stato = "Chiuso"
+    a.score = score_annuncio(a)
+    a.rilevante = a.score >= 12   # FIX v5: soglia 12 (era 10)
+    return a
 
 
-# ─────────────────────────────────────────────────────────────
-#  FONTE 9: Concorsando.it — aggregatore PA con sezione Puglia/Lecce
-# ─────────────────────────────────────────────────────────────
-def scrape_concorsando() -> list[Annuncio]:
-    log.info("📋 Concorsando.it...")
-    annunci = []
+# ============================================================
+# DB
+# ============================================================
 
-    for url in [
-        "https://www.concorsando.it/blog/concorsi-puglia/",
-        "https://www.concorsando.it/blog/concorsi-lecce/",
-        "https://www.concorsando.it/blog/concorsi-categorie-protette/",
-        "https://www.concorsando.it/blog/?s=categorie+protette+puglia",
-        "https://www.concorsando.it/blog/?s=articolo+16+disabili",
-    ]:
-        soup = get_soup(url, timeout=CONFIG["timeout_veloce"])
-        if not soup:
-            continue
-        for art in soup.select("article, .entry-card, .post"):
-            testo = art.get_text(" ", strip=True)
-            link_el = art.select_one("a[href]")
-            titolo_el = art.select_one("h2, h3, .entry-title, .post-title")
-            if not titolo_el or len(testo) < 10:
-                continue
-            # Filtra: solo annunci rilevanti per Lecce/Puglia o CP
-            if not (e_lecce(testo) or contiene(testo, KEYWORDS_TUTTE)
-                    or contiene(testo, ["puglia", "salento"])):
-                continue
-            titolo = titolo_el.get_text(strip=True)[:200]
-            href = assoluto(link_el["href"] if link_el else "", "https://www.concorsando.it")
-            annunci.append(Annuncio(
-                titolo=titolo, fonte="Concorsando.it",
-                url=href,
-                data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
-                descrizione=testo[:300], tipo="PA",
-                art16=rileva_art16(testo), art1=rileva_art1(testo),
-            ))
-
-    log.info(f"  → {len(annunci)} Concorsando")
-    return annunci
-
-
-# ─────────────────────────────────────────────────────────────
-#  FONTE 10: Indeed — offerte lavoro Lecce categorie protette
-# ─────────────────────────────────────────────────────────────
-def scrape_indeed() -> list[Annuncio]:
-    log.info("💼 Indeed Lecce...")
-    annunci = []
-
-    queries = [
-        ("categorie protette", "Lecce"),
-        ("collocamento mirato", "Lecce, Puglia"),
-        ("invalidità civile lavoro", "Lecce"),
-        ("disabili art 1 legge 68", "Puglia"),
-        ("articolo 16 assunzione disabili", "Puglia"),
-    ]
-
-    for q, loc in queries:
-        soup = get_soup(
-            "https://it.indeed.com/lavoro",
-            params={"q": q, "l": loc, "sort": "date"},
-            timeout=CONFIG["timeout_lento"]
-        )
-        if not soup:
-            continue
-        for card in soup.select(".job_seen_beacon, [data-jk], .jobsearch-SerpJobCard"):
-            titolo_el = card.select_one("h2 a, .jobtitle, [data-testid='job-title']")
-            azienda_el = card.select_one(".companyName, [data-testid='company-name']")
-            luogo_el   = card.select_one(".companyLocation, [data-testid='text-location']")
-            link_el    = card.select_one("a[href]")
-            if not titolo_el:
-                continue
-            titolo  = titolo_el.get_text(strip=True)
-            azienda = azienda_el.get_text(strip=True) if azienda_el else ""
-            luogo   = luogo_el.get_text(strip=True)   if luogo_el   else ""
-            href    = assoluto(link_el["href"] if link_el else "", "https://it.indeed.com")
-            testo   = titolo + " " + azienda + " " + luogo + " " + q
-
-            annunci.append(Annuncio(
-                titolo=titolo, fonte="Indeed",
-                url=href,
-                data_pubblicazione=datetime.now().strftime("%Y-%m-%d"),
-                ente=azienda, descrizione=f"Luogo: {luogo}", tipo="Privato",
-                art16=rileva_art16(testo), art1=rileva_art1(testo),
-            ))
-
-    log.info(f"  → {len(annunci)} Indeed")
-    return annunci
-
-
-# ─────────────────────────────────────────────────────────────
-#  FONTE 11: Portale Lavoro per Te (ANPAL / MLPS)
-#  Sezione offerte con collocamento mirato
-# ─────────────────────────────────────────────────────────────
-def scrape_aggregatori_lecce() -> list[Annuncio]:
-    """
-    Aggrega da siti che già indicizzano bene i concorsi di Lecce
-    e hanno URL stabili e verificati.
-    """
-    log.info("🔎 Aggregatori concorsi Lecce...")
-    annunci = []
-
-    fonti = [
-        # concorsipubblici.com — URL VERIFICATO, lista Lecce aggiornata
-        ("concorsipubblici.com",
-         "https://www.concorsipubblici.com/concorsi/regione/loc/lecce",
-         "https://www.concorsipubblici.com"),
-
-        # concorsando.it — URL VERIFICATO, lista Lecce non scaduti
-        ("Concorsando Lecce",
-         "https://www.concorsando.it/blog/concorsi-lecce/",
-         "https://www.concorsando.it"),
-
-        # concorsando — categorie protette nazionale
-        ("Concorsando Cat.Protette",
-         "https://www.concorsando.it/blog/?s=categorie+protette+puglia",
-         "https://www.concorsando.it"),
-
-        # concorsando — ASL Lecce 2026
-        ("Concorsando ASL Lecce",
-         "https://www.concorsando.it/blog/concorso-asl-lecce-a-tempo-determinato-2026/",
-         "https://www.concorsando.it"),
-
-        # concorsi.it — aggregatore con ASL Lecce
-        ("concorsi.it ASL Lecce",
-         "https://www.concorsi.it/ente/35707-azienda-sanitaria-locale-di-lecce.html",
-         "https://www.concorsi.it"),
-    ]
-
-    for nome_fonte, url, base in fonti:
-        soup = get_soup(url, timeout=CONFIG["timeout_veloce"])
-        if not soup:
-            continue
-        trovati = _estrai_annunci_da_soup(
-            soup, nome_fonte, "", base, solo_rilevanti=True
-        )
-        # per aggregatori filtra per rilevanza geografica o cat. protette
-        for a in trovati:
-            testo = a.titolo + " " + a.descrizione
-            if e_lecce(testo) or contiene(testo, KEYWORDS_TUTTE) or contiene(testo, ["puglia","salento","asl lecce","comune lecce"]):
-                annunci.append(a)
-
-    log.info(f"  → {len(annunci)} aggregatori")
-    return annunci
-
-
-# ─────────────────────────────────────────────────────────────
-#  DATABASE SQLite — memoria persistente tra esecuzioni
-# ─────────────────────────────────────────────────────────────
-def init_db(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+def init_db(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS annunci (
             url TEXT PRIMARY KEY,
+            chiave TEXT,
             titolo TEXT,
             fonte TEXT,
             ente TEXT,
             data_pubblicazione TEXT,
-            trovato_il TEXT,
             scadenza TEXT,
             posti TEXT,
-            art16 INTEGER DEFAULT 0,
-            art1  INTEGER DEFAULT 0,
-            tipo  TEXT,
+            tipo TEXT,
+            art1 INTEGER,
+            art16 INTEGER,
+            score INTEGER,
+            stato TEXT,
+            rilevante INTEGER,
             testo_completo TEXT,
-            notificato INTEGER DEFAULT 0
+            trovato_il TEXT
         )
-    """)
-    conn.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS annunci_fts
-        USING fts5(url UNINDEXED, titolo, testo_completo, ente,
-                   content='annunci', content_rowid='rowid')
     """)
     conn.commit()
     return conn
 
-def _data_scaduta(scadenza_str: str, giorni_tolleranza: int = 30) -> bool:
-    """Restituisce True se la scadenza è già passata da più di N giorni."""
-    if not scadenza_str:
-        return False
-    import re as _re2
-    # normalizza separatori
-    d = _re2.sub(r'[-.]', '/', scadenza_str.strip())
-    for fmt in ('%d/%m/%Y', '%Y/%m/%d', '%d/%m/%y'):
-        try:
-            dt = datetime.strptime(d[:10], fmt)
-            return dt < (datetime.now() - timedelta(days=giorni_tolleranza))
-        except ValueError:
-            continue
-    return False
 
-def filtra_nuovi(conn: sqlite3.Connection,
-                 annunci: list[Annuncio]) -> list[Annuncio]:
-    nuovi = []
-    for a in annunci:
-        if not a.url or len(a.url) < 5:
-            continue
-        # Scarta se la scadenza è già passata da oltre 30 giorni
-        if _data_scaduta(a.scadenza, giorni_tolleranza=30):
-            log.debug(f"Scaduto: {a.titolo[:50]} [{a.scadenza}]")
-            continue
-        row = conn.execute("SELECT 1 FROM annunci WHERE url=?",
-                           (a.url,)).fetchone()
-        if not row:
-            nuovi.append(a)
-    return nuovi
+def seen_url(conn: sqlite3.Connection, url: str) -> bool:
+    return bool(conn.execute("SELECT 1 FROM annunci WHERE url=?", (url,)).fetchone())
 
-def salva_annunci(conn: sqlite3.Connection, annunci: list[Annuncio]):
-    for a in annunci:
-        try:
-            conn.execute("""
-                INSERT OR IGNORE INTO annunci
-                (url,titolo,fonte,ente,data_pubblicazione,trovato_il,
-                 scadenza,posti,art16,art1,tipo,testo_completo)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (a.url, a.titolo, a.fonte, a.ente,
-                  a.data_pubblicazione, a.trovato_il,
-                  a.scadenza, a.posti,
-                  int(a.art16), int(a.art1), a.tipo,
-                  a.testo_completo))
-        except Exception as e:
-            log.warning(f"DB insert: {e}")
+
+def save_annunci(conn: sqlite3.Connection, items: list[Annuncio]) -> None:
+    for a in items:
+        conn.execute("""
+            INSERT OR REPLACE INTO annunci (
+                url, chiave, titolo, fonte, ente, data_pubblicazione,
+                scadenza, posti, tipo, art1, art16, score, stato,
+                rilevante, testo_completo, trovato_il
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            a.url, chiave_annuncio(a), a.titolo, a.fonte, a.ente,
+            a.data_pubblicazione, a.scadenza, a.posti, a.tipo,
+            int(a.art1), int(a.art16), a.score, a.stato,
+            int(a.rilevante), a.testo_completo, a.trovato_il,
+        ))
     conn.commit()
 
 
-# ─────────────────────────────────────────────────────────────
-#  EMAIL
-# ─────────────────────────────────────────────────────────────
-def invia_email(annunci: list[Annuncio], config: dict):
-    if not config.get("email_destinatario") or not annunci:
-        return
+# ============================================================
+# DEDUP
+# ============================================================
 
-    art16_list = [a for a in annunci if a.art16]
-    art1_list  = [a for a in annunci if a.art1 and not a.art16]
-    altri      = [a for a in annunci if not a.art1 and not a.art16]
-
-    def riga_html(a: Annuncio) -> str:
-        badge16 = '<span style="background:#1565C0;color:#fff;padding:2px 7px;border-radius:4px;font-size:11px">ART.16 DIRETTO</span>' if a.art16 else ""
-        badge1  = '<span style="background:#2E7D32;color:#fff;padding:2px 7px;border-radius:4px;font-size:11px">ART.1 L.68</span>' if a.art1 else ""
-        return f"""
-        <div style="border-left:4px solid {'#1565C0' if a.art16 else '#2E7D32' if a.art1 else '#999'};
-                    padding:10px 14px;margin:8px 0;background:#f9f9f9;border-radius:0 6px 6px 0">
-          <div style="font-weight:600;margin-bottom:4px">{a.titolo[:100]}</div>
-          <div style="font-size:12px;color:#555">{a.fonte} · {a.tipo} · {a.data_pubblicazione}</div>
-          <div style="margin:4px 0">{badge16} {badge1}</div>
-          <a href="{a.url}" style="font-size:12px;color:#1565C0">{a.url[:80]}</a>
-          {f'<p style="font-size:12px;color:#444;margin:4px 0">{a.descrizione[:120]}...</p>' if a.descrizione else ""}
-        </div>"""
-
-    corpo = f"""
-<html><body style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto">
-<h2 style="color:#1565C0">🔔 Lavoro Categorie Protette — Lecce</h2>
-<p><b>{len(annunci)}</b> nuovi annunci · {datetime.now().strftime("%d/%m/%Y %H:%M")}</p>
-<p>⭐ Art.16 (accesso diretto): <b>{len(art16_list)}</b> &nbsp;
-   ✅ Art.1 L.68/99: <b>{len(art1_list)}</b> &nbsp;
-   📋 Altri: <b>{len(altri)}</b></p>
-<hr>
-{'<h3 style="color:#1565C0">⭐ Art. 16 — Accesso Diretto (PRIORITARI)</h3>' + "".join(riga_html(a) for a in art16_list) if art16_list else ""}
-{'<h3 style="color:#2E7D32">✅ Art. 1 L.68/99 — Liste Collocamento Mirato</h3>' + "".join(riga_html(a) for a in art1_list) if art1_list else ""}
-{'<h3>📋 Concorsi PA Lecce (filtro generico)</h3>' + "".join(riga_html(a) for a in altri[:20]) if altri else ""}
-<hr style="margin-top:24px">
-<p style="font-size:11px;color:#888">
-ARPAL Lecce: <a href="https://arpal.regione.puglia.it/cpi/lecce/">arpal.regione.puglia.it</a> |
-InPA: <a href="https://www.inpa.gov.it">inpa.gov.it</a> |
-GU: <a href="https://www.gazzettaufficiale.it/ricerca/concorsi">gazzettaufficiale.it</a>
-</p>
-</body></html>
-"""
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = (
-        f"[Lecce CP] {len(annunci)} nuovi"
-        f"{' — ' + str(len(art16_list)) + ' Art.16!' if art16_list else ''}"
-    )
-    msg["From"] = config["email_mittente"]
-    msg["To"]   = config["email_destinatario"]
-    msg.attach(MIMEText(corpo, "html", "utf-8"))
-
-    try:
-        with smtplib.SMTP(config["smtp_server"], config["smtp_port"]) as s:
-            s.starttls()
-            s.login(config["email_mittente"], config["email_password"])
-            s.sendmail(config["email_mittente"],
-                       config["email_destinatario"], msg.as_string())
-        log.info(f"📧 Email inviata → {config['email_destinatario']}")
-    except Exception as e:
-        log.error(f"Errore email: {e}")
+def normalizza_titolo(t: str) -> str:
+    t = norm(t).lower()
+    t = re.sub(r"\b(avviso|bando|selezione|concorso|manifestazione di interesse|"
+               r"rettifica|allegato|graduatoria|verbale|convocazione|esito)\b", " ", t)
+    t = re.sub(r"\b\d+\b", " ", t)
+    return re.sub(r"\s+", " ", t).strip()[:160]
 
 
-# ─────────────────────────────────────────────────────────────
-#  TELEGRAM
-# ─────────────────────────────────────────────────────────────
-def invia_telegram(annunci: list[Annuncio], config: dict):
-    token   = config.get("telegram_bot_token")
-    chat_id = config.get("telegram_chat_id")
-    if not token or not chat_id or not annunci:
-        return
+def chiave_annuncio(a: Annuncio) -> str:
+    return f"{norm(a.ente or a.fonte).lower()}::{normalizza_titolo(a.titolo)}"
 
-    art16_list = [a for a in annunci if a.art16]
-    data = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    righe = [
-        f"🔔 *Lavoro Cat.Protette — Lecce*",
-        f"📅 {data}",
-        f"📊 {len(annunci)} nuovi annunci",
-        "",
+def dedup_by_url(items: list[Annuncio]) -> list[Annuncio]:
+    seen, out = set(), []
+    for a in items:
+        if a.url and a.url not in seen:
+            seen.add(a.url)
+            out.append(a)
+    return out
+
+
+def dedup_by_key(items: list[Annuncio]) -> list[Annuncio]:
+    best: dict[str, Annuncio] = {}
+    for a in items:
+        key = chiave_annuncio(a)
+        cur = best.get(key)
+        if cur is None:
+            best[key] = a
+            continue
+        rank_a = (a.score, int(a.rilevante), int(bool(a.testo_completo)), int(bool(a.scadenza)))
+        rank_c = (cur.score, int(cur.rilevante), int(bool(cur.testo_completo)), int(bool(cur.scadenza)))
+        if rank_a > rank_c:
+            best[key] = a
+    return list(best.values())
+
+
+# ============================================================
+# SCRAPER GENERICO ENTI
+# ============================================================
+
+def is_candidate(entity: dict, text: str) -> bool:
+    """
+    FIX v5: filtro geo SEMPRE obbligatorio, tranne per aggregatori
+    (che già filtrano per provincia nella loro URL).
+    """
+    low = text.lower()
+    if len(low) < 20 or nav_match(low) or neg_match(low):
+        return False
+
+    tipo = entity.get("tipo", "PA")
+
+    # Gli aggregatori indicizzano già per Lecce — basta che sia un bando
+    if tipo == "AGGREGATORE":
+        return bando_match(low) and (cp_match(low) or art16_match(low) or "lecce" in low)
+
+    if tipo == "ARPAL":
+        return cp_match(low) or art16_match(low) or "collocamento mirato" in low
+
+    # Per tutti gli enti PA: bando + (CP o Art16) + geo obbligatorio
+    if not bando_match(low):
+        return False
+    if not (cp_match(low) or art16_match(low)):
+        return False
+    if not geo_match(low):   # FIX v5: geo richiesto
+        return False
+    return True
+
+
+def extract_items_from_page(entity: dict, soup: BeautifulSoup, page_url: str) -> list[Annuncio]:
+    out, seen_local = [], set()
+    for sel in ["article","tr","li",".card",".entry",".item",".news-item","a[href]"]:
+        for el in soup.select(sel):
+            link = el if el.name == "a" else el.select_one("a[href]")
+            if not link:
+                continue
+            href = assoluto(link.get("href",""), page_url)
+            titolo = norm(link.get_text(" ", strip=True))
+            ctx = norm(el.get_text(" ", strip=True))
+            whole = f"{titolo} {ctx} {href}"
+
+            if href in seen_local or len(titolo) < 8:
+                continue
+            seen_local.add(href)
+
+            if not is_candidate(entity, whole):
+                continue
+
+            a = Annuncio(
+                titolo=titolo[:240], fonte=entity["fonte"],
+                url=href, data_pubblicazione=extract_first_date(ctx),
+                descrizione=ctx[:600], ente=entity["ente"],
+                tipo=entity["tipo"],
+            )
+            finalize(a)
+            out.append(a)
+    return out
+
+
+def scrape_entity(entity: dict) -> list[Annuncio]:
+    log.info(f"🏛️  {entity['nome']}...")
+    ssl = entity.get("ssl", False)   # FIX v5: ogni ente ha il suo flag SSL
+    results = []
+    for url in entity["urls"]:
+        soup = get_soup(url, timeout=CONFIG["timeout_fast"], ssl=ssl)
+        if not soup:
+            continue
+        try:
+            found = extract_items_from_page(entity, soup, url)
+            results.extend(found)
+        except Exception as e:
+            log.warning(f"Parse failed {entity['nome']} {url} → {e}")
+    log.info(f"   → {len(results)} candidati")
+    return results
+
+
+# ============================================================
+# BUILDER COMUNI
+# ============================================================
+
+def build_comune_entity(nome: str) -> dict:
+    slug = slugify_comune(nome)
+    base_at  = f"https://amministrazionetrasparente.comune.{slug}.le.it"
+    base_www = f"https://www.comune.{slug}.le.it"
+    return {
+        "nome": f"Comune di {nome}",
+        "fonte": f"Comune di {nome}",
+        "ente": f"Comune di {nome}",
+        "tipo": "PA",
+        "ssl": False,  # verify=False perché molti comuni hanno cert problematici
+        "urls": [
+            f"{base_at}/amministrazione-trasparente/bandi-di-concorso",
+            f"{base_at}/bandi-di-concorso",
+            f"{base_www}/amministrazione-trasparente/bandi-di-concorso",
+            f"{base_www}/concorsi",
+            f"{base_www}/bandi-concorso",
+        ],
+    }
+
+
+def all_entities() -> list[dict]:
+    out = list(ENTI_SALENTO)
+    for comune in COMUNI_LECCE:
+        out.append(build_comune_entity(comune))
+    return out
+
+
+# ============================================================
+# GAZZETTA UFFICIALE
+# ============================================================
+
+def scrape_gazzetta() -> list[Annuncio]:
+    log.info("📰 Gazzetta Ufficiale RSS...")
+    items = []
+    for rss in [
+        "https://www.gazzettaufficiale.it/rss/concorsi.xml",
+        "https://www.gazzettaufficiale.it/rss/esecutivi.xml",
+    ]:
+        try:
+            feed = feedparser.parse(rss)
+        except Exception as e:
+            log.warning(f"RSS {rss} → {e}")
+            continue
+        for entry in feed.entries[:100]:
+            titolo  = norm(entry.get("title",""))
+            summary = norm(BeautifulSoup(entry.get("summary",""), "html.parser").get_text(" ",strip=True))
+            link    = entry.get("link","")
+            pub     = ""
+            if entry.get("published_parsed"):
+                pub = datetime(*entry.published_parsed[:6]).strftime("%Y-%m-%d")
+            whole = f"{titolo} {summary} {link}"
+            if neg_match(whole): continue
+            if not (cp_match(whole) or art16_match(whole)): continue
+            if not geo_match(whole): continue
+            a = Annuncio(titolo=titolo, fonte="Gazzetta Ufficiale",
+                         url=link, data_pubblicazione=pub,
+                         descrizione=summary[:500], ente="PA", tipo="PA")
+            finalize(a)
+            if a.score >= 12:
+                items.append(a)
+    log.info(f"   → {len(items)} candidati")
+    return items
+
+
+# ============================================================
+# INPA
+# ============================================================
+
+def scrape_inpa() -> list[Annuncio]:
+    log.info("📋 InPA API...")
+    items = []
+    queries = [
+        "categorie protette puglia",
+        "categorie protette lecce",
+        "collocamento mirato puglia",
+        "articolo 16 puglia",
+        "legge 68/99 lecce",
     ]
+    for q in queries:
+        try:
+            r = SESSION.get(
+                "https://www.inpa.gov.it/wp-json/wp/v2/posts",
+                params={"search": q, "per_page": 15,
+                        "_fields": "title,link,date,excerpt"},
+                timeout=CONFIG["timeout"],
+            )
+            r.raise_for_status()
+            sleep_polite()
+            data = r.json()
+        except Exception as e:
+            log.warning(f"InPA [{q}] → {e}")
+            continue
+        for item in data:
+            titolo  = norm(BeautifulSoup(item.get("title",{}).get("rendered",""), "html.parser").get_text())
+            excerpt = norm(BeautifulSoup(item.get("excerpt",{}).get("rendered",""), "html.parser").get_text())
+            link    = item.get("link","")
+            pub     = (item.get("date","") or "")[:10]
+            whole   = f"{titolo} {excerpt} {link}"
+            if neg_match(whole): continue
+            if not (cp_match(whole) or art16_match(whole)): continue
+            if not geo_match(whole): continue
+            a = Annuncio(titolo=titolo, fonte="InPA", url=link,
+                         data_pubblicazione=pub, descrizione=excerpt[:500],
+                         ente="PA", tipo="PA")
+            finalize(a)
+            if a.score >= 12:
+                items.append(a)
+    log.info(f"   → {len(items)} candidati")
+    return items
 
-    if art16_list:
-        righe.append("⭐ *ART.16 — Accesso Diretto (PRIORITARI):*")
-        for a in art16_list[:5]:
-            righe.append(f"• [{a.titolo[:55]}]({a.url})\n  `{a.fonte}`")
-        righe.append("")
 
-    art1_list = [a for a in annunci if a.art1 and not a.art16]
-    if art1_list:
-        righe.append("✅ *ART.1 L.68/99:*")
-        for a in art1_list[:5]:
-            righe.append(f"• [{a.titolo[:55]}]({a.url})\n  `{a.fonte}`")
+# ============================================================
+# DETTAGLIO PAGINA
+# ============================================================
 
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": "\n".join(righe),
-                  "parse_mode": "Markdown",
-                  "disable_web_page_preview": True},
-            timeout=10
-        )
-        if r.ok:
-            log.info("📱 Telegram inviato")
-        else:
-            log.warning(f"Telegram: {r.text[:200]}")
-    except Exception as e:
-        log.error(f"Telegram error: {e}")
+def download_detail(a: Annuncio, ssl: bool = False) -> Annuncio:
+    if a.dettaglio_scaricato or not a.url or len(a.url) < 12:
+        return a
+    r = get(a.url, timeout=CONFIG["timeout"], ssl=ssl)
+    if not r:
+        return a
+    content_type = (r.headers.get("Content-Type") or "").lower()
+    if "pdf" in content_type or looks_like_attachment(a.url):
+        a.dettaglio_scaricato = True
+        return finalize(a)
+    soup = BeautifulSoup(r.text, "html.parser")
+    a.testo_completo = clean_page_text(soup)
+    a.dettaglio_scaricato = True
+    return finalize(a)
 
 
-# ─────────────────────────────────────────────────────────────
-#  REPORT TXT + JSON
-# ─────────────────────────────────────────────────────────────
-def genera_report(nuovi: list[Annuncio], n_totale_db: int):
+def download_best_details(items: list[Annuncio], limit: int) -> None:
+    ordered = sorted(items, key=lambda x: (x.art16, x.art1, x.score), reverse=True)
+    log.info(f"⬇️  Scarico dettagli per i migliori {min(limit, len(ordered))} annunci...")
+    for i, a in enumerate(ordered[:limit], 1):
+        log.info(f"   [{i}/{min(limit, len(ordered))}] {a.titolo[:80]}")
+        # SSL = False per la maggior parte dei siti PA
+        ssl = any(d in a.url for d in ["inpa.gov.it", "gazzettaufficiale.it",
+                                        "concorsando.it", "concorsipubblici.com",
+                                        "concorsi.it", "unisalento.it"])
+        download_detail(a, ssl=ssl)
+
+
+# ============================================================
+# FILTRO FINALE
+# ============================================================
+
+def final_filter(items: list[Annuncio]) -> list[Annuncio]:
+    out = []
+    for a in items:
+        finalize(a)
+        text = " ".join([a.titolo, a.descrizione, a.testo_completo, a.url]).lower()
+
+        if nav_match(text) or neg_match(text):
+            continue
+        if expired(a.scadenza):
+            continue
+        if too_old(a.data_pubblicazione):   # FIX v5: safe su date vuote
+            continue
+
+        # FIX v5: geo sempre obbligatorio (anche dopo aver scaricato il dettaglio)
+        if a.tipo not in ("ARPAL", "AGGREGATORE") and not geo_match(text):
+            continue
+
+        if a.score < 12:   # FIX v5: soglia 12
+            continue
+
+        if a.tipo == "ARPAL":
+            if cp_match(text) or art16_match(text) or "collocamento mirato" in text:
+                out.append(a)
+            continue
+
+        if cp_match(text) or art16_match(text):
+            out.append(a)
+
+    out.sort(key=lambda x: (
+        x.art16, x.art1,
+        x.stato == "Aperto",
+        parse_date_iso(x.data_pubblicazione) or datetime.min,
+        x.score,
+    ), reverse=True)
+    return out
+
+
+def filter_new(conn: sqlite3.Connection, items: list[Annuncio]) -> list[Annuncio]:
+    return [a for a in items if not seen_url(conn, a.url)]
+
+
+# ============================================================
+# REPORT
+# ============================================================
+
+def txt_card(a: Annuncio) -> str:
+    lines = [
+        "=" * 80,
+        f"TITOLO:    {a.titolo}",
+        f"FONTE:     {a.fonte}  |  ENTE: {a.ente or '-'}",
+        f"TIPO:      {a.tipo}  |  SCORE: {a.score}",
+        f"DATA:      {a.data_pubblicazione or '-'}  |  SCADENZA: {a.scadenza or '???'}",
+        f"POSTI:     {a.posti or '-'}  |  STATO: {a.stato or '-'}",
+        f"ART.1:     {'✅ SÌ' if a.art1 else 'NO'}  |  ART.16: {'⭐ SÌ' if a.art16 else 'NO'}",
+        f"URL:       {a.url}",
+    ]
+    if a.descrizione:
+        lines += ["", "── SNIPPET ──", a.descrizione[:400]]
+    if a.testo_completo:
+        lines += ["", "── TESTO COMPLETO ──"]
+        lines += [line for line in a.testo_completo[:3000].splitlines() if line.strip()]
+    return "\n".join(lines)
+
+
+def _he(s: str) -> str:
+    return html.escape(s or "")
+
+
+def generate_reports(items: list[Annuncio], total_db: int) -> None:
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
+    art16  = [a for a in items if a.art16]
+    art1   = [a for a in items if a.art1 and not a.art16]
+    others = [a for a in items if not a.art1 and not a.art16]
 
-    art16  = [a for a in nuovi if a.art16]
-    art1   = [a for a in nuovi if a.art1 and not a.art16]
-    pa     = [a for a in nuovi if a.tipo == "PA" and not a.art1 and not a.art16]
-    arpal  = [a for a in nuovi if a.tipo == "ARPAL" and not a.art16]
-    priv   = [a for a in nuovi if a.tipo == "Privato"]
-
-    W = 68
-    sep = "═" * W
-    sep2 = "─" * W
-
-    def sezione(emoji, titolo, lista, max_item=50):
-        if not lista:
-            return ""
-        lines = [f"\n{sep2}", f"{emoji}  {titolo.upper()}", sep2]
-        for a in lista[:max_item]:
-            lines += [
-                f"\n  {'='*60}",
-                f"  TITOLO:  {a.titolo}",
-                f"  Ente:    {a.ente or a.fonte}",
-                f"  Tipo:    {a.tipo}  |  Fonte: {a.fonte}",
-                f"  Data:    {a.data_pubblicazione}",
-                f"  URL:     {a.url}",
-            ]
-            if a.scadenza:
-                lines.append(f"  SCADENZA: {a.scadenza}  ⚠️")
-            if a.posti:
-                lines.append(f"  POSTI:    {a.posti}")
-            if a.testo_completo:
-                lines.append(f"\n  ── TESTO ANNUNCIO ──────────────────────────────")
-                for riga in a.testo_completo[:3000].splitlines():
-                    if riga.strip():
-                        lines.append(f"  {riga.strip()}")
-                lines.append(f"  ────────────────────────────────────────────────")
-            elif a.descrizione:
-                lines.append(f"  Descrizione: {a.descrizione}")
-        return "\n".join(lines)
-
-    corpo = "\n".join([
-        sep,
-        "  RICERCA LAVORO — CATEGORIE PROTETTE L.68/99",
-        "  Provincia di LECCE  ·  Art.16 + Art.1",
-        f"  Aggiornato: {now}",
-        sep,
-        "",
-        f"  NUOVI ANNUNCI:     {len(nuovi)}",
-        f"  ⭐ Art.16 diretti: {len(art16)}",
-        f"  ✅ Art.1 L.68/99:  {len(art1)}",
-        f"  🏛️  PA generica:    {len(pa)}",
-        f"  🏢 ARPAL/CPI:      {len(arpal)}",
-        f"  💼 Privato:        {len(priv)}",
-        f"  📚 Tot. nel DB:    {n_totale_db}",
-        "",
-        "  ⭐ ART.16 = accesso diretto, niente graduatoria",
-        "  ✅ ART.1  = iscrizione liste collocamento mirato",
-    ])
-
-    corpo += sezione("⭐", "Art.16 — Accesso Diretto (PRIORITARI)", art16)
-    corpo += sezione("✅", "Art.1 L.68/99 — Collocamento Mirato", art1)
-    corpo += sezione("🏛️ ", "Pubblica Amministrazione — Lecce/Puglia", pa)
-    corpo += sezione("🏢", "ARPAL / Centri per l'Impiego", arpal)
-    corpo += sezione("💼", "Offerte Private — Lecce", priv)
-
-    corpo += "\n\n" + sep2 + "\n📌  CONTATTI UTILI\n" + sep2
-    corpo += """
-  ARPAL / CPI Lecce:
-    https://arpal.regione.puglia.it/cpi/lecce/
-    Via Vecchia Copertino 4, 73100 Lecce
-    Tel. 0832/688111
-
-  InPA (concorsi PA nazionali):
-    https://www.inpa.gov.it
-
-  Gazzetta Ufficiale 3a serie:
-    https://www.gazzettaufficiale.it/ricerca/concorsi
-
-  Comune di Lecce — Bandi:
-    https://www.comune.lecce.it
-
-  Normativa Art.16 L.R. Puglia 17/2005:
-    https://www.regione.puglia.it
-"""
-    corpo += f"\n{sep}\n  Script eseguito: {now}\n{sep}\n"
+    # TXT
+    parts = [
+        "═" * 80,
+        "CERCA LAVORO — CATEGORIE PROTETTE L.68/99 — LECCE / SALENTO",
+        f"Aggiornato: {now}",
+        "═" * 80, "",
+        f"Nuovi: {len(items)}  |  Art.16: {len(art16)}  |  Art.1: {len(art1)}  |  DB: {total_db}", "",
+    ]
+    if art16:  parts += ["⭐ ART.16 / CHIAMATA DIRETTA", ""] + [txt_card(a) for a in art16]
+    if art1:   parts += ["", "✅ ART.1 / L.68/99", ""] + [txt_card(a) for a in art1]
+    if others: parts += ["", "📌 ALTRI RISULTATI", ""] + [txt_card(a) for a in others]
 
     with open(CONFIG["output_txt"], "w", encoding="utf-8") as f:
-        f.write(corpo)
-    print(corpo)
+        f.write("\n".join(parts))
 
     with open(CONFIG["output_json"], "w", encoding="utf-8") as f:
         json.dump({
             "aggiornato": now,
-            "totale_nuovi": len(nuovi),
-            "art16": len(art16),
-            "art1":  len(art1),
-            "annunci": [asdict(a) for a in nuovi],
+            "totale_nuovi": len(items),
+            "art16": len(art16), "art1": len(art1),
+            "annunci": [asdict(a) for a in items],
         }, f, ensure_ascii=False, indent=2)
 
-    log.info(f"Report → {CONFIG['output_txt']} | {CONFIG['output_json']}")
-
-
-# ─────────────────────────────────────────────────────────────
-#  REPORT HTML — leggibile nel browser, con testo completo
-# ─────────────────────────────────────────────────────────────
-def genera_report_html(annunci: list):
-    """Genera risultati_lecce.html — apri nel browser per leggere gli annunci."""
-    if not annunci:
-        return
-
-    art16  = [a for a in annunci if a.art16]
-    art1   = [a for a in annunci if a.art1 and not a.art16]
-    altri  = [a for a in annunci if not a.art1 and not a.art16]
-    now    = datetime.now().strftime("%d/%m/%Y %H:%M")
-
-    def card(a: Annuncio, colore: str) -> str:
-        badge16 = '<span class="badge b16">⭐ ART.16 — ACCESSO DIRETTO</span>' if a.art16 else ""
-        badge1  = '<span class="badge b1">✅ ART.1 L.68/99</span>' if a.art1 else ""
-        testo_html = ""
-        if a.testo_completo:
-            righe = ""
-            for riga in a.testo_completo.splitlines():
-                r = riga.strip()
-                if not r:
-                    continue
-                # Evidenzia keyword importanti
-                for kw in ["art. 16","art.16","articolo 16","accesso diretto",
-                           "art. 1","legge 68","categorie protette","collocamento mirato",
-                           "scadenza","entro il","posti","invalidità","disabil"]:
-                    r = _re.sub(f'({_re.escape(kw)})', r'<mark>\1</mark>', r, flags=_re.IGNORECASE)
-                righe += f"<p>{r}</p>\n"
-            testo_html = f'<div class="testo">{righe}</div>'
-        elif a.descrizione:
-            testo_html = f'<div class="testo"><p>{a.descrizione}</p></div>'
-
-        scad_html = f'<div class="scadenza">⚠️ Scadenza: <strong>{a.scadenza}</strong></div>' if a.scadenza else ""
-        posti_html = f'<div class="posti">👥 {a.posti}</div>' if a.posti else ""
-
+    # HTML
+    def card_html(a: Annuncio) -> str:
+        badges = ""
+        if a.art16: badges += '<span class="badge b16">⭐ ART.16 DIRETTO</span> '
+        if a.art1:  badges += '<span class="badge b1">✅ ART.1 / L.68</span> '
+        if a.stato: badges += f'<span class="badge bst">{_he(a.stato)}</span>'
+        testo = (_he(a.testo_completo[:3000]) if a.testo_completo
+                 else _he(a.descrizione[:500])).replace("\n","<br>")
+        # Evidenzia parole chiave nel testo
+        for kw in ["categorie protette","art. 16","art. 1","collocamento mirato",
+                   "scadenza","posti","disabil","invalidità","legge 68"]:
+            testo = re.sub(f"({re.escape(kw)})", r'<mark>\1</mark>', testo, flags=re.IGNORECASE)
         return f"""
-        <div class="card" style="border-left-color:{colore}">
-          <div class="card-header">
-            <h3><a href="{a.url}" target="_blank">{a.titolo}</a></h3>
-            <div class="meta">
-              <span>📌 {a.ente or a.fonte}</span>
-              <span>🏷️ {a.tipo}</span>
-              <span>📅 {a.data_pubblicazione}</span>
-              <span>🔗 <a href="{a.url}" target="_blank">Apri annuncio originale ↗</a></span>
-            </div>
-            <div class="badges">{badge16}{badge1}</div>
-            {scad_html}{posti_html}
+        <div class="card">
+          <h3><a href="{_he(a.url)}" target="_blank" rel="noopener">{_he(a.titolo)}</a></h3>
+          <div class="meta">
+            <span>📌 {_he(a.ente or a.fonte)}</span>
+            <span>🏷️ {_he(a.tipo)}</span>
+            <span>📅 {_he(a.data_pubblicazione or '-')}</span>
+            {'<span class="scad">⚠️ Scadenza: <strong>' + _he(a.scadenza) + '</strong></span>' if a.scadenza else ""}
+            {'<span>👥 ' + _he(a.posti) + '</span>' if a.posti else ""}
+            <span>Score: {a.score}</span>
           </div>
-          {testo_html}
+          <div class="badges">{badges}</div>
+          <details>
+            <summary>Testo completo ↓</summary>
+            <div class="testo">{testo}</div>
+          </details>
         </div>"""
 
-    def sezione_html(emoji, titolo, lista, colore) -> str:
-        if not lista:
-            return ""
-        cards = "\n".join(card(a, colore) for a in lista)
-        return f"""
-        <section>
-          <h2>{emoji} {titolo} <span class="count">({len(lista)})</span></h2>
-          {cards}
-        </section>"""
+    def sezione(emoji, titolo, lista):
+        if not lista: return ""
+        return f"<h2>{emoji} {titolo} <small>({len(lista)})</small></h2>" + "".join(card_html(a) for a in lista)
 
-    html = f"""<!DOCTYPE html>
+    html_doc = f"""<!doctype html>
 <html lang="it">
 <head>
-<meta charset="UTF-8">
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Lavoro Categorie Protette — Lecce — {now}</title>
+<title>Categorie Protette — Lecce — {now}</title>
 <style>
-  * {{ box-sizing:border-box; margin:0; padding:0 }}
-  body {{ font-family:system-ui,sans-serif; background:#f4f6f9; color:#222; line-height:1.6 }}
-  header {{ background:#1565C0; color:#fff; padding:20px 32px }}
-  header h1 {{ font-size:22px; font-weight:600 }}
-  header p  {{ font-size:14px; opacity:.85; margin-top:4px }}
-  .stats {{ display:flex; gap:12px; padding:16px 32px; background:#e3eaf7; flex-wrap:wrap }}
-  .stat {{ background:#fff; border-radius:8px; padding:10px 20px; text-align:center; min-width:110px }}
-  .stat strong {{ display:block; font-size:26px; color:#1565C0 }}
-  .stat span {{ font-size:12px; color:#555 }}
-  main {{ max-width:960px; margin:0 auto; padding:24px 16px }}
-  section {{ margin-bottom:32px }}
-  section h2 {{ font-size:18px; font-weight:600; margin-bottom:12px;
-                padding:8px 16px; border-radius:6px; background:#fff;
-                border-left:4px solid #1565C0 }}
-  section h2 .count {{ font-size:14px; font-weight:400; color:#666 }}
-  .card {{ background:#fff; border-radius:8px; margin-bottom:16px;
-           border-left:5px solid #1565C0; box-shadow:0 1px 4px rgba(0,0,0,.08) }}
-  .card-header {{ padding:16px 20px 10px }}
-  .card-header h3 {{ font-size:16px; margin-bottom:6px }}
-  .card-header h3 a {{ color:#1565C0; text-decoration:none }}
-  .card-header h3 a:hover {{ text-decoration:underline }}
-  .meta {{ display:flex; gap:16px; font-size:12px; color:#666; flex-wrap:wrap; margin-bottom:8px }}
-  .badges {{ display:flex; gap:8px; flex-wrap:wrap; margin:6px 0 }}
-  .badge {{ padding:3px 10px; border-radius:20px; font-size:12px; font-weight:600 }}
-  .b16 {{ background:#FFF3E0; color:#E65100; border:1px solid #FFB74D }}
-  .b1  {{ background:#E8F5E9; color:#2E7D32; border:1px solid #81C784 }}
-  .scadenza {{ font-size:13px; color:#C62828; margin:4px 0; font-weight:500 }}
-  .posti {{ font-size:13px; color:#1565C0; margin:4px 0 }}
-  .testo {{ padding:12px 20px 16px; border-top:1px solid #eee;
-            font-size:14px; max-height:500px; overflow-y:auto }}
-  .testo p {{ margin-bottom:8px; color:#333 }}
-  .testo mark {{ background:#FFF9C4; padding:1px 3px; border-radius:3px;
-                 font-weight:600; color:#333 }}
-  details summary {{ cursor:pointer; padding:8px 20px; font-size:13px;
-                     color:#1565C0; background:#f0f4ff; border-top:1px solid #e0e8ff }}
-  details[open] summary {{ background:#e0eaff }}
-  @media(max-width:600px) {{ .stats,.meta {{ flex-direction:column }} }}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:system-ui,sans-serif;background:#f0f4fb;color:#1a1a1a;line-height:1.6}}
+header{{background:#1346a0;color:#fff;padding:20px 28px}}
+header h1{{font-size:20px;font-weight:600}}
+header p{{font-size:13px;opacity:.8;margin-top:4px}}
+.stats{{display:flex;gap:12px;flex-wrap:wrap;padding:16px 28px;background:#dce8ff}}
+.stat{{background:#fff;border-radius:10px;padding:10px 18px;text-align:center}}
+.stat strong{{display:block;font-size:24px;color:#1346a0}}
+.stat span{{font-size:12px;color:#555}}
+main{{max-width:980px;margin:0 auto;padding:20px 16px}}
+h2{{margin:28px 0 12px;font-size:17px;padding:8px 14px;background:#fff;border-radius:8px;border-left:4px solid #1346a0}}
+h2 small{{font-weight:400;color:#666;font-size:13px}}
+.card{{background:#fff;border-radius:12px;padding:16px 20px;margin-bottom:14px;box-shadow:0 1px 5px rgba(0,0,0,.07)}}
+.card h3{{font-size:15px;margin-bottom:6px}}
+.card h3 a{{color:#1346a0;text-decoration:none}}
+.card h3 a:hover{{text-decoration:underline}}
+.meta{{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;color:#666;margin-bottom:8px}}
+.scad{{color:#c0392b;font-weight:500}}
+.badges{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}}
+.badge{{padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700}}
+.b16{{background:#fff3e0;color:#e65100;border:1px solid #ffb74d}}
+.b1{{background:#e8f5e9;color:#2e7d32;border:1px solid #81c784}}
+.bst{{background:#e8eaf6;color:#283593;border:1px solid #9fa8da}}
+details summary{{cursor:pointer;padding:8px 0;font-size:13px;color:#1346a0}}
+.testo{{font-size:13px;line-height:1.6;color:#333;padding:10px 0;max-height:450px;overflow-y:auto}}
+mark{{background:#fff9c4;padding:1px 2px;border-radius:2px;font-weight:600}}
 </style>
 </head>
 <body>
 <header>
-  <h1>🔔 Lavoro Categorie Protette — Provincia di Lecce</h1>
-  <p>Aggiornato: {now} · Art.16 (accesso diretto) + Art.1 L.68/99</p>
+  <h1>🔔 Categorie Protette L.68/99 — Lecce / Salento</h1>
+  <p>Aggiornato: {now} · Art.16 (accesso diretto) + Art.1 (collocamento mirato) · 96 comuni + enti</p>
 </header>
 <div class="stats">
-  <div class="stat"><strong>{len(annunci)}</strong><span>Nuovi annunci</span></div>
-  <div class="stat"><strong style="color:#E65100">{len(art16)}</strong><span>Art.16 Diretti</span></div>
-  <div class="stat"><strong style="color:#2E7D32">{len(art1)}</strong><span>Art.1 L.68/99</span></div>
-  <div class="stat"><strong style="color:#555">{len(altri)}</strong><span>Concorsi PA</span></div>
+  <div class="stat"><strong>{len(items)}</strong><span>Nuovi annunci</span></div>
+  <div class="stat"><strong style="color:#e65100">{len(art16)}</strong><span>Art.16 Diretti</span></div>
+  <div class="stat"><strong style="color:#2e7d32">{len(art1)}</strong><span>Art.1 L.68/99</span></div>
+  <div class="stat"><strong style="color:#555">{len(others)}</strong><span>Altri concorsi</span></div>
+  <div class="stat"><strong style="color:#888">{total_db}</strong><span>Tot. in archivio</span></div>
 </div>
 <main>
-{sezione_html("⭐", "Art.16 — Accesso Diretto (PRIORITARI)", art16, "#E65100")}
-{sezione_html("✅", "Art.1 L.68/99 — Collocamento Mirato", art1, "#2E7D32")}
-{sezione_html("🏛️", "Pubblica Amministrazione — Lecce/Puglia", altri[:30], "#1565C0")}
+{sezione("⭐", "Art.16 — Accesso Diretto (PRIORITARI)", art16)}
+{sezione("✅", "Art.1 L.68/99 — Collocamento Mirato", art1)}
+{sezione("📌", "Altri concorsi PA — Lecce / Salento", others)}
 </main>
 </body>
 </html>"""
 
-    with open("risultati_lecce.html", "w", encoding="utf-8") as f:
-        f.write(html)
-    log.info("🌐 Report HTML → risultati_lecce.html  (aprilo nel browser!)")
+    with open(CONFIG["output_html"], "w", encoding="utf-8") as f:
+        f.write(html_doc)
+
+    log.info(f"Report → {CONFIG['output_txt']} | {CONFIG['output_json']} | {CONFIG['output_html']}")
 
 
-# ─────────────────────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────────────────────
-def main():
-    print("\n" + "═" * 68)
-    print("  CERCA LAVORO — CATEGORIE PROTETTE — PROVINCIA DI LECCE")
-    print("  Art.16 (accesso diretto) + Art.1 L.68/99")
-    print("═" * 68 + "\n")
+# ============================================================
+# NOTIFICHE
+# ============================================================
+
+def send_email(items: list[Annuncio]) -> None:
+    if not items or not all([CONFIG["email_destinatario"],
+                              CONFIG["email_mittente"],
+                              CONFIG["email_password"]]):
+        return
+
+    def row(a: Annuncio) -> str:
+        c = "#e65100" if a.art16 else "#2e7d32" if a.art1 else "#1346a0"
+        tags = " | ".join(filter(None, [
+            "⭐ ART.16" if a.art16 else "",
+            "✅ ART.1" if a.art1 else "",
+            a.stato or "",
+        ]))
+        snippet = _he(a.testo_completo[:400] if a.testo_completo else a.descrizione[:400])
+        return f"""
+        <div style="border-left:4px solid {c};background:#f8faff;padding:10px 14px;margin:10px 0;border-radius:0 8px 8px 0">
+          <div style="font-weight:700;margin-bottom:4px">{_he(a.titolo)}</div>
+          <div style="font-size:12px;color:#555">{_he(a.fonte)} · {_he(a.ente or '-')}</div>
+          <div style="font-size:12px;color:#555">
+            📅 {_he(a.data_pubblicazione or '-')} · ⚠️ Scadenza: <strong>{_he(a.scadenza or '???')}</strong> · 👥 {_he(a.posti or '-')}
+          </div>
+          <div style="font-size:12px;margin:4px 0">{tags}</div>
+          {'<div style="font-size:12px;color:#333;margin:6px 0">' + snippet + '</div>' if snippet else ''}
+          <a href="{_he(a.url)}" style="font-size:12px;color:#1346a0">{_he(a.url[:80])}</a>
+        </div>"""
+
+    art16 = [a for a in items if a.art16]
+    art1  = [a for a in items if a.art1 and not a.art16]
+    altri = [a for a in items if not a.art1 and not a.art16]
+
+    body = f"""
+    <html><body style="font-family:Arial,sans-serif;max-width:760px;margin:auto">
+      <h2 style="color:#1346a0">🔔 Categorie Protette — Lecce / Salento</h2>
+      <p>Nuovi: <b>{len(items)}</b> · Art.16: <b>{len(art16)}</b> · Art.1: <b>{len(art1)}</b></p>
+      {"<h3>⭐ Art.16 — Accesso Diretto</h3>" + "".join(row(a) for a in art16) if art16 else ""}
+      {"<h3>✅ Art.1 L.68/99</h3>" + "".join(row(a) for a in art1) if art1 else ""}
+      {"<h3>📌 Altri concorsi</h3>" + "".join(row(a) for a in altri[:15]) if altri else ""}
+    </body></html>"""
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = (f"[Lecce CP] {len(items)} nuovi"
+                      + (f" — {len(art16)} ART.16!" if art16 else ""))
+    msg["From"] = CONFIG["email_mittente"]
+    msg["To"]   = CONFIG["email_destinatario"]
+    msg.attach(MIMEText(body, "html", "utf-8"))
+
+    try:
+        with smtplib.SMTP(CONFIG["smtp_server"], CONFIG["smtp_port"]) as s:
+            s.starttls()
+            s.login(CONFIG["email_mittente"], CONFIG["email_password"])
+            s.sendmail(CONFIG["email_mittente"], CONFIG["email_destinatario"], msg.as_string())
+        log.info("📧 Email inviata")
+    except Exception as e:
+        log.error(f"Email failed → {e}")
+
+
+def send_telegram(items: list[Annuncio]) -> None:
+    token   = CONFIG["telegram_bot_token"]
+    chat_id = CONFIG["telegram_chat_id"]
+    if not token or not chat_id or not items:
+        return
+
+    art16 = [a for a in items if a.art16]
+    lines = [
+        "🔔 *Categorie Protette — Lecce / Salento*",
+        f"Nuovi: *{len(items)}* · Art.16: *{len(art16)}*", "",
+    ]
+    for a in items[:12]:
+        tags = " | ".join(filter(None,[
+            "⭐ ART.16" if a.art16 else "",
+            "✅ ART.1"  if a.art1  else "",
+            a.stato or "",
+        ]))
+        title = a.titolo[:70].replace("[","(").replace("]",")")
+        lines += [f"• *{title}*", f"  `{a.fonte}` {tags}", f"  {a.url}"]
+
+    try:
+        r = SESSION.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": "\n".join(lines),
+                  "parse_mode": "Markdown", "disable_web_page_preview": True},
+            timeout=12,
+        )
+        r.raise_for_status()
+        log.info("📱 Telegram inviato")
+    except Exception as e:
+        log.error(f"Telegram failed → {e}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+    print("\n" + "═" * 80)
+    print("CERCA LAVORO — CATEGORIE PROTETTE L.68/99 — LECCE / SALENTO")
+    print("96 comuni + enti pubblici + aggregatori · Art.16 + Art.1")
+    print("═" * 80 + "\n")
 
     conn = init_db(CONFIG["db_path"])
+    raw: list[Annuncio] = []
 
-    fonti = [
-        scrape_inpa,
-        scrape_regione_puglia,
-        scrape_arpal,
-        scrape_gazzetta_ufficiale,
-        scrape_comune_lecce,
-        scrape_comuni_lecce,
-        scrape_asl_lecce,
-        scrape_provincia_lecce,
-        scrape_concorsando,
-        scrape_indeed,
-        scrape_aggregatori_lecce,
-    ]
-
-    grezzi = []
-    for fn in fonti:
+    for fn in [scrape_gazzetta, scrape_inpa]:
         try:
-            res = fn()
-            grezzi.extend(res)
+            raw.extend(fn())
         except Exception as e:
-            log.error(f"Errore in {fn.__name__}: {e}")
+            log.error(f"{fn.__name__} → {e}")
 
-    log.info(f"\n📊 Totale grezzo: {len(grezzi)}")
+    enti = all_entities()
+    log.info(f"Enti da scandire: {len(enti)}")
+    for entity in enti:
+        try:
+            raw.extend(scrape_entity(entity))
+        except Exception as e:
+            log.error(f"Entity {entity['nome']} → {e}")
 
-    # Deduplica per URL
-    visti: set = set()
-    dedup = []
-    for a in grezzi:
-        if a.url and a.url not in visti:
-            visti.add(a.url)
-            dedup.append(a)
+    log.info(f"Totale grezzo: {len(raw)}")
 
-    # Solo quelli nuovi rispetto al DB
-    nuovi = filtra_nuovi(conn, dedup)
-    log.info(f"🆕 Nuovi (non nel DB): {len(nuovi)}")
+    stage1 = dedup_by_url(raw)
+    log.info(f"Dopo dedup URL: {len(stage1)}")
 
-    # ── SCARICA TESTO COMPLETO di ogni annuncio trovato ──
-    if nuovi:
-        scarica_tutti_dettagli(nuovi, max_annunci=60)
+    stage1.sort(key=lambda x: x.score, reverse=True)
+    download_best_details(stage1, CONFIG["max_dettagli"])
 
-    salva_annunci(conn, nuovi)
-    n_db = conn.execute("SELECT COUNT(*) FROM annunci").fetchone()[0]
+    stage2 = [finalize(a) for a in stage1]
+    stage3 = dedup_by_key(stage2)
+    log.info(f"Dopo dedup chiave: {len(stage3)}")
 
-    genera_report(nuovi, n_db)
-    genera_report_html(nuovi)   # report HTML leggibile nel browser
+    final_items = final_filter(stage3)
+    log.info(f"Finali pertinenti: {len(final_items)}")
 
-    if nuovi:
-        invia_email(nuovi, CONFIG)
-        invia_telegram(nuovi, CONFIG)
+    new_items = filter_new(conn, final_items)
+    log.info(f"Nuovi non in DB: {len(new_items)}")
 
-    print(f"\n✅ Completato — {len(nuovi)} nuovi annunci trovati.")
-    print(f"   ⭐ Art.16: {sum(1 for a in nuovi if a.art16)}")
-    print(f"   ✅ Art.1:  {sum(1 for a in nuovi if a.art1)}")
-    print(f"   Report:   {CONFIG['output_txt']}")
+    save_annunci(conn, new_items)
+    total_db = conn.execute("SELECT COUNT(*) FROM annunci").fetchone()[0]
+
+    generate_reports(new_items, total_db)
+
+    if new_items:
+        send_email(new_items)
+        send_telegram(new_items)
+
+    print(f"\n✅ Completato — nuovi risultati pertinenti: {len(new_items)}")
+    print(f"   ⭐ Art.16: {sum(1 for a in new_items if a.art16)}")
+    print(f"   ✅ Art.1:  {sum(1 for a in new_items if a.art1 and not a.art16)}")
+    print(f"   📄 TXT:   {CONFIG['output_txt']}")
+    print(f"   🌐 HTML:  {CONFIG['output_html']}")
+    print(f"   🗂️  DB:    {CONFIG['db_path']}")
     conn.close()
 
 
