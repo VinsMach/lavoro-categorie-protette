@@ -216,14 +216,29 @@ FONTI_HTML: list[dict] = [
         ],
     },
     {
-        "nome": "concorsi.it ASL Lecce",
+        "nome": "concorsi.it — Lecce / L.68",
         "fonte": "concorsi.it",
         "ente": "",
         "tipo": "AGGREGATORE",
         "ssl": True,
         "urls": [
+            # ASL Lecce
             "https://www.concorsi.it/ente/35707-azienda-sanitaria-locale-di-lecce.html",
+            # Ricerca "1999" = anno legge 68/99 — trova tutti i bandi CP
+            "https://www.concorsi.it/risultati?ric=1999",
+            # Puglia + categorie protette
             "https://www.concorsi.it/concorsi/regione/puglia/?q=categorie+protette",
+        ],
+    },
+    {
+        "nome": "MinInterno — GU Concorsi",
+        "fonte": "mininterno.net",
+        "ente": "",
+        "tipo": "AGGREGATORE",
+        "ssl": True,
+        "urls": [
+            # Sezione GU tag 13 = bandi per categorie protette/disabili
+            "https://www.mininterno.net/gu-tag-13",
         ],
     },
 ]
@@ -439,71 +454,77 @@ def dedup(items: list[Annuncio]) -> list[Annuncio]:
 
 
 # ============================================================
-# ① InPA — API REST
+# ① InPA — pagine pubbliche /bandi-e-avvisi/ con filtri URL
+#   regioneId=13 = Puglia  |  status=OPEN = aperti
+#   L'API portale.inpa.gov.it richiede autenticazione (401)
 # ============================================================
 
-def scrape_inpa() -> list[Annuncio]:
-    log.info("📋 InPA API...")
-    items = []
-    base = "https://portale.inpa.gov.it/api"
+# URL pubblici InPA con filtri — regioneId 13 = Puglia
+INPA_URLS = [
+    # Puglia + "categorie protette"
+    "https://www.inpa.gov.it/bandi-e-avvisi/?text=categorie+protette&regioneId=13&status=OPEN&page_num=0",
+    # Puglia + "68/99" (riferimento legge)
+    "https://www.inpa.gov.it/bandi-e-avvisi/?text=68%2F99&regioneId=13&status=OPEN&page_num=0",
+    # Puglia + "art. 1" (art.1 L.68)
+    "https://www.inpa.gov.it/bandi-e-avvisi/?text=art.+1&regioneId=13&status=OPEN&page_num=0",
+    # Puglia + "collocamento mirato"
+    "https://www.inpa.gov.it/bandi-e-avvisi/?text=collocamento+mirato&regioneId=13&status=OPEN&page_num=0",
+    # Puglia + "1999" (anno legge)
+    "https://www.inpa.gov.it/bandi-e-avvisi/?text=1999&regioneId=13&status=OPEN&page_num=0",
+    # Tutti i bandi aperti in Puglia (per non perdere nulla)
+    "https://www.inpa.gov.it/bandi-e-avvisi/?regioneId=13&status=OPEN&page_num=0",
+]
 
-    queries = [
-        {"keyword": "categorie protette", "regione": "Puglia", "stato": "APERTO", "page": 0, "size": 50},
-        {"keyword": "collocamento mirato", "regione": "Puglia", "stato": "APERTO", "page": 0, "size": 50},
-        {"keyword": "lecce categorie protette", "stato": "APERTO", "page": 0, "size": 50},
-        {"keyword": "art. 1 legge 68 puglia", "stato": "APERTO", "page": 0, "size": 50},
-    ]
-
-    for params in queries:
-        data = jget(f"{base}/concorsi/search", params=params)
-        if not data:
-            continue
-        entries = data if isinstance(data, list) else data.get("content", data.get("items", []))
-        if not isinstance(entries, list):
-            continue
-        for item in entries:
-            titolo = n(item.get("titolo") or item.get("title") or item.get("denominazione") or "")
-            descr  = n(item.get("descrizione") or item.get("description") or "")
-            cid    = item.get("id") or item.get("concorsoId") or item.get("uuid") or ""
-            link   = item.get("url") or item.get("link") or (
-                f"https://www.inpa.gov.it/bandi-e-avvisi/dettaglio-bando-avviso/?concorso_id={cid}" if cid else "")
-            pub    = (item.get("dataPubblicazione") or item.get("dataInserimento") or "")[:10]
-            scad   = (item.get("dataScadenza") or item.get("scadenza") or "")[:10]
-            ente   = n(item.get("amministrazione") or item.get("ente") or "")
-            posti  = str(item.get("numeroPosti") or item.get("posti") or "")
-            if not titolo or not link:
+def _inpa_parse_page(pg: BeautifulSoup, base: str) -> list[Annuncio]:
+    """Estrae annunci da una pagina InPA."""
+    out = []
+    # InPA è una SPA React — il contenuto può essere in diversi contenitori
+    for sel in [
+        "article", ".bando-card", ".job-card", ".opportunity-card",
+        ".card", "li.bando", "[class*='bando']", "[class*='concorso']",
+        # fallback: qualsiasi link con testo lungo
+        "a[href]",
+    ]:
+        for el in pg.select(sel):
+            lnk = el if el.name == "a" else el.select_one("a[href]")
+            tit = el.select_one("h2, h3, h4, .title, .titolo, strong") or lnk
+            if not tit or not lnk:
                 continue
-            a = Annuncio(titolo=titolo[:240], fonte="InPA", url=link,
-                         ente=ente, tipo="PA", data_pub=pub, scadenza=scad,
-                         posti=f"{posti} posti" if posti.isdigit() else posti,
-                         descrizione=descr[:400])
+            titolo = n(tit.get_text())
+            ctx    = n(el.get_text(" "))
+            href   = aurl(lnk.get("href", ""), base)
+            if len(titolo) < 10 or not href:
+                continue
+            if neg(ctx):
+                continue
+            a = Annuncio(
+                titolo=titolo[:240], fonte="InPA", url=href,
+                ente="PA", tipo="PA",
+                data_pub=first_date(ctx), descrizione=ctx[:400],
+            )
             finalize(a)
-            if a.score >= 10:
-                items.append(a)
+            out.append(a)
+    return out
 
-    # Fallback scraping se API non risponde
-    if not items:
-        log.info("   InPA API vuota — provo scraping /bandi-e-avvisi/...")
-        for fb_url in [
-            "https://www.inpa.gov.it/bandi-e-avvisi/?regione=puglia&stato=aperto",
-            "https://www.inpa.gov.it/bandi-e-avvisi/?q=categorie+protette&stato=aperto",
-        ]:
-            pg = soup(fb_url, ssl=True)
-            if not pg: continue
-            for card in pg.select("article, .bando-card, .card, li.bando"):
-                lnk = card.select_one("a[href]")
-                tit = card.select_one("h2, h3, .title, a")
-                if not tit: continue
-                titolo = n(tit.get_text())
-                ctx    = n(card.get_text(" "))
-                link   = aurl(lnk["href"] if lnk else "", "https://www.inpa.gov.it")
-                if neg(ctx) or not (cp(ctx) or a16(ctx)): continue
-                a = Annuncio(titolo=titolo[:240], fonte="InPA", url=link,
-                             ente="PA", tipo="PA", data_pub=first_date(ctx),
-                             descrizione=ctx[:400])
-                finalize(a)
-                if a.score >= 10:
-                    items.append(a)
+
+def scrape_inpa() -> list[Annuncio]:
+    log.info("📋 InPA (pagine pubbliche /bandi-e-avvisi/)...")
+    items = []
+    seen_href: set[str] = set()
+    BASE = "https://www.inpa.gov.it"
+
+    for url in INPA_URLS:
+        pg = soup(url, ssl=True, timeout=TIMEOUT)
+        if not pg:
+            continue
+        candidati = _inpa_parse_page(pg, BASE)
+        for a in candidati:
+            if a.url in seen_href:
+                continue
+            seen_href.add(a.url)
+            # Score minimo 8 — meno restrittivo perché siamo già filtrati per Puglia
+            if a.score >= 8:
+                items.append(a)
 
     log.info(f"   → {len(items)} InPA")
     return items
@@ -605,8 +626,40 @@ def fetch_best(items: list[Annuncio]) -> None:
 # FILTRO FINALE
 # ============================================================
 
+# Parole che indicano laurea obbligatoria — candidata ha solo diploma
+RICHIEDE_LAUREA = [
+    "laurea magistrale", "laurea specialistica", "laurea triennale",
+    "laureati", "laurea in ", "in possesso di laurea",
+    "dirigente medico", "dirigenti medici",
+    "medico", "odontoiatra", "farmacista", "veterinario",
+    "ingegnere", "architetto", "avvocato",
+    "dottorato", "master universitario",
+]
+
+# Parole che confermano accessibilità con diploma
+OK_DIPLOMA = [
+    "diploma", "scuola secondaria superiore", "maturità",
+    "licenza media", "scuola dell'obbligo",
+    "istruttore", "collaboratore", "assistente",
+    "operatore", "addetto", "esecutore",
+    "categoria b", "categoria c", "area b", "area c",
+    "area degli assistenti", "area degli operatori",
+]
+
+
+def richiede_solo_laurea(t: str) -> bool:
+    """True se il testo indica chiaramente che serve la laurea."""
+    low = t.lower()
+    # se menziona diploma, è probabilmente accessibile
+    if has(low, OK_DIPLOMA):
+        return False
+    # se menziona laurea senza diploma, escludi
+    return has(low, RICHIEDE_LAUREA)
+
+
 def filtra(items: list[Annuncio]) -> list[Annuncio]:
     out = []
+    scartati_laurea = 0
     for a in items:
         finalize(a)
         t = " ".join([a.titolo, a.descrizione, a.testo, a.url]).lower()
@@ -616,7 +669,14 @@ def filtra(items: list[Annuncio]) -> list[Annuncio]:
         if a.tipo not in ("ARPAL", "AGGREGATORE") and not geo(t): continue
         if a.score < 12: continue
         if not (cp(t) or a16(t)): continue
+        # Filtra bandi che richiedono esplicitamente la laurea
+        if richiede_solo_laurea(t):
+            scartati_laurea += 1
+            log.debug(f"Escluso (laurea): {a.titolo[:60]}")
+            continue
         out.append(a)
+    if scartati_laurea:
+        log.info(f"   Scartati per requisito laurea: {scartati_laurea}")
     out.sort(key=lambda x: (x.art16, x.art1, to_dt(x.data_pub) or datetime.min, x.score), reverse=True)
     return out
 
@@ -678,8 +738,15 @@ def invia_telegram(items: list[Annuncio]) -> None:
         elif a.descrizione:
             estratto = a.descrizione[:300]
 
+        # Segnala se il bando sembra accessibile con diploma
+        diploma_ok = has(
+            " ".join([a.titolo, a.descrizione, a.testo]).lower(),
+            OK_DIPLOMA
+        )
+        diploma_nota = " [diploma OK]" if diploma_ok else ""
+
         msg = (
-            f"{tipo_label}\n"
+            f"{tipo_label}{diploma_nota}\n"
             f"{a.titolo[:120]}\n\n"
             f"Ente: {a.ente or a.fonte}\n"
             + (f"Scadenza: {a.scadenza}\n" if a.scadenza else "")
