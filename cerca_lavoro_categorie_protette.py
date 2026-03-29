@@ -64,19 +64,35 @@ GIORNI_SCAD  = 7           # tolleranza scadenza (annunci scaduti da max N giorn
 # PAROLE CHIAVE
 # ============================================================
 
+# Segnali generici di categorie protette (Art.1 + Art.18 insieme)
 POSITIVE_CP = [
     "categorie protette", "categoria protetta",
     "l.68/99", "l. 68/99", "legge 68/99", "legge 68/1999",
-    "collocamento mirato", "art. 1", "articolo 1",
+    "collocamento mirato",
     "invalidità civile", "invalidita civile",
     "disabilità", "disabilita", "disabili",
     "riserva disabili", "posto riservato", "liste speciali",
-    "art. 18", "articolo 18",
+    # Art.1 esplicito — NON include art.18
+    "art. 1", "art.1", "articolo 1",
+    "comma 1", "comma 2", "comma 3",       # commi tipici art.1 L.68
+]
+
+# Segnali che indicano SOLO Art.18 (orfani, vedove, vittime terrorismo)
+# → NON accessibili con invalidità civile
+ART18_ONLY = [
+    "art. 18", "art.18", "articolo 18",
+    "orfani", "orfano", "orfane",
+    "vedove di guerra", "vedova di guerra",
+    "vittime del terrorismo", "vittime di terrorismo",
+    "vittime del dovere",
+    "profughi", "rifugiati politici",
+    "legge 407/1998", "l. 407/1998", "l.407/98",  # altra norma CP art.18
 ]
 
 ART16_HINTS = [
-    "art. 16", "articolo 16", "chiamata nominativa",
-    "chiamata diretta", "avviamento a selezione", "accesso diretto",
+    "art. 16", "art.16", "articolo 16",
+    "chiamata nominativa", "chiamata diretta",
+    "avviamento a selezione", "accesso diretto",
     "l.r. 17/2005",
 ]
 
@@ -348,6 +364,35 @@ def bando(t):return has(t, BANDO_WORDS)
 def neg(t):  return has(t, NEGATIVE_WORDS)
 
 
+def art1_match(text: str) -> bool:
+    """
+    Cerca tutte le varianti di "Art.1 L.68/99" nel testo:
+      art. 1 / art.1 / art 1 / art1 / articolo 1 / article 1
+    Tutte con o senza spazi, punteggiatura opzionale.
+    """
+    low = n(text).lower()
+    # Regex: "art" + spazi/punti opzionali + "1" non seguito da altra cifra
+    # Cattura: art1, art.1, art. 1, art 1, art  1
+    if re.search(r'art[\.\s]*1(?!\d)', low):
+        return True
+    # Forma estesa
+    if "articolo 1" in low or "articolo1" in low:
+        return True
+    return False
+
+
+def art18_only(text: str) -> bool:
+    """
+    True se il testo menziona Art.18 MA NON Art.1.
+    Questi bandi sono riservati a categorie (orfani, vedove, ecc.)
+    che non includono l'invalidità civile Art.1 L.68/99.
+    """
+    low = n(text).lower()
+    ha_art18 = has(low, ART18_ONLY)
+    ha_art1  = art1_match(low)
+    return ha_art18 and not ha_art1
+
+
 def dates(text: str) -> list[str]:
     out = []
     for m in re.finditer(r"\b([0-3]?\d)[/\-.]([01]?\d)[/\-.](20\d{2})\b", text):
@@ -433,7 +478,8 @@ def finalize(a: Annuncio) -> Annuncio:
     if not a.data_pub: a.data_pub = first_date(t)
     if not a.scadenza: a.scadenza = scad_from(t)
     if not a.posti:    a.posti    = posti_from(t)
-    if not a.art1:     a.art1     = cp(t)
+    # Art.1: usa la regex robusta (cattura art1/art.1/art 1/articolo 1)
+    if not a.art1:     a.art1     = art1_match(t)
     if not a.art16:    a.art16    = a16(t)
     a.score = score(a)
     return a
@@ -659,25 +705,57 @@ def richiede_solo_laurea(t: str) -> bool:
 
 def filtra(items: list[Annuncio]) -> list[Annuncio]:
     out = []
-    scartati_laurea = 0
+    sc_laurea = sc_art18 = sc_score = 0
+
     for a in items:
         finalize(a)
         t = " ".join([a.titolo, a.descrizione, a.testo, a.url]).lower()
-        if neg(t): continue
-        if expired(a.scadenza): continue
-        if too_old(a.data_pub): continue
-        if a.tipo not in ("ARPAL", "AGGREGATORE") and not geo(t): continue
-        if a.score < 12: continue
-        if not (cp(t) or a16(t)): continue
-        # Filtra bandi che richiedono esplicitamente la laurea
-        if richiede_solo_laurea(t):
-            scartati_laurea += 1
-            log.debug(f"Escluso (laurea): {a.titolo[:60]}")
+
+        if neg(t):                                                  continue
+        if expired(a.scadenza):                                     continue
+        if too_old(a.data_pub):                                     continue
+        if a.tipo not in ("ARPAL", "AGGREGATORE") and not geo(t):  continue
+        if a.score < 12:
+            sc_score += 1;                                          continue
+
+        # ── Filtro CP + Art.1 ─────────────────────────────────
+        # Il bando deve avere almeno un segnale CP/Art16
+        if not (cp(t) or a16(t)):                                   continue
+
+        # ESCLUDI se il bando è riservato solo all'Art.18
+        # (orfani, vedove, vittime terrorismo — categoria diversa)
+        if art18_only(t):
+            sc_art18 += 1
+            log.info(f"Escluso Art.18 only: {a.titolo[:65]}")
             continue
+
+        # Se il testo è lungo abbastanza (dettaglio scaricato) e non trova
+        # alcuna variante di Art.1, è probabilmente solo Art.18 → escludi
+        if len(t) > 300 and cp(t) and not art1_match(t) and not a16(t):
+            sc_art18 += 1
+            log.info(f"Escluso (no Art.1): {a.titolo[:65]}")
+            continue
+
+        # ── Filtro titolo di studio ───────────────────────────
+        if richiede_solo_laurea(t):
+            sc_laurea += 1
+            log.info(f"Escluso (laurea):   {a.titolo[:65]}")
+            continue
+
+        # Aggiorna flag art1 con la regex robusta
+        if not a.art1:
+            a.art1 = art1_match(t)
+
         out.append(a)
-    if scartati_laurea:
-        log.info(f"   Scartati per requisito laurea: {scartati_laurea}")
-    out.sort(key=lambda x: (x.art16, x.art1, to_dt(x.data_pub) or datetime.min, x.score), reverse=True)
+
+    log.info(f"   Scartati — score basso: {sc_score} | "
+             f"solo Art.18: {sc_art18} | laurea: {sc_laurea}")
+
+    out.sort(key=lambda x: (
+        x.art16, x.art1,
+        to_dt(x.data_pub) or datetime.min,
+        x.score,
+    ), reverse=True)
     return out
 
 
