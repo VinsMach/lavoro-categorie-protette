@@ -238,12 +238,14 @@ FONTI_HTML: list[dict] = [
         "tipo": "AGGREGATORE",
         "ssl": True,
         "urls": [
-            # ASL Lecce
+            # ASL Lecce (verificato)
             "https://www.concorsi.it/ente/35707-azienda-sanitaria-locale-di-lecce.html",
-            # Ricerca "1999" = anno legge 68/99 — trova tutti i bandi CP
+            # Ricerca "1999" = anno legge 68/99 (verificato)
             "https://www.concorsi.it/risultati?ric=1999",
-            # Puglia + categorie protette
-            "https://www.concorsi.it/concorsi/regione/puglia/?q=categorie+protette",
+            # FIX: rimosso /concorsi/regione/puglia/?q= → 404
+            # Usa la ricerca testuale che funziona
+            "https://www.concorsi.it/risultati?ric=categorie+protette+puglia",
+            "https://www.concorsi.it/risultati?ric=art+1+legge+68+puglia",
         ],
     },
     {
@@ -618,125 +620,164 @@ def scrape_gu() -> list[Annuncio]:
 # ============================================================
 
 ASTE_ART16_FONTI = [
-    # ── PUGLIA — massima priorità ─────────────────────────────
+    # ── PUGLIA — URL ESATTO fornito ────────────────────────────
     {
-        "nome": "ARPAL Puglia — Offerte PA Art.16",
-        "url":  "https://arpal.regione.puglia.it/opportunita/offerte-lavoro-pa-articolo-16",
+        "nome": "SINTESI Puglia — Art.16 Lecce",
+        "url":  "https://sintesi.regione.puglia.it/web/sintesi-lecce/articolo-16",
         "ssl":  False,
     },
-    # SINTESI = portale aste Art.16 per provincia di Lecce
+    # Le altre province pugliesi (comodo averle per confronto)
     {
-        "nome": "SINTESI — Art.16 Provincia di Lecce",
-        "url":  "https://sintesi.regione.puglia.it/sintesi/avvisiSelezioneList.do?provincia=LE&tipoAvviso=ART16",
-        "ssl":  False,
-    },
-    {
-        "nome": "SINTESI — Art.16 Provincia di Brindisi",
-        "url":  "https://sintesi.regione.puglia.it/sintesi/avvisiSelezioneList.do?provincia=BR&tipoAvviso=ART16",
+        "nome": "SINTESI Puglia — Art.16 Bari",
+        "url":  "https://sintesi.regione.puglia.it/web/sintesi-bari/articolo-16",
         "ssl":  False,
     },
     {
-        "nome": "SINTESI — Art.16 Provincia di Taranto",
-        "url":  "https://sintesi.regione.puglia.it/sintesi/avvisiSelezioneList.do?provincia=TA&tipoAvviso=ART16",
-        "ssl":  False,
-    },
-    # ── EMILIA-ROMAGNA — agenzialavoro.emr.it ─────────────────
-    # Province ER con aste aperte (le altre sono spesso vuote)
-    {
-        "nome": "ARL Emilia-Romagna — Aste Art.16 Bologna",
-        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/bo",
-        "ssl":  True,
-    },
-    {
-        "nome": "ARL Emilia-Romagna — Aste Art.16 Modena",
-        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/mo",
-        "ssl":  True,
-    },
-    {
-        "nome": "ARL Emilia-Romagna — Aste Art.16 Reggio Emilia",
-        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/re",
-        "ssl":  True,
-    },
-    {
-        "nome": "ARL Emilia-Romagna — Aste Art.16 Ferrara",
-        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/fe",
-        "ssl":  True,
-    },
-    {
-        "nome": "ARL Emilia-Romagna — Aste Art.16 Ravenna",
-        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/ra",
-        "ssl":  True,
-    },
-    {
-        "nome": "ARL Emilia-Romagna — Aste Art.16 Parma",
-        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/pr",
-        "ssl":  True,
-    },
-    {
-        "nome": "ARL Emilia-Romagna — Aste Art.16 Rimini",
-        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/rn",
-        "ssl":  True,
-    },
-    {
-        "nome": "ARL Emilia-Romagna — Aste Art.16 Forlì-Cesena",
-        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/fc",
-        "ssl":  True,
-    },
-    {
-        "nome": "ARL Emilia-Romagna — Aste Art.16 Piacenza",
-        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/pc",
-        "ssl":  True,
-    },
-    # ── CALABRIA ──────────────────────────────────────────────
-    {
-        "nome": "Regione Calabria — Avviamenti Art.16",
-        "url":  "https://lavoro.regione.calabria.it/offerte-di-lavoro/aste-articolo-16/",
-        "ssl":  False,
-    },
-    # ── ALTRE REGIONI ─────────────────────────────────────────
-    {
-        "nome": "Regione Toscana — Art.16 CPI",
-        "url":  "https://www.regione.toscana.it/avvisi-art-16",
-        "ssl":  True,
-    },
-    {
-        "nome": "Regione Lazio — Art.16 ARPAL Lazio",
-        "url":  "https://www.arpalazio.it/avvisi-art-16",
-        "ssl":  True,
-    },
-    {
-        "nome": "Regione Campania — Art.16 ARLAS",
-        "url":  "https://www.arlas.it/avvisi-art-16/",
-        "ssl":  True,
-    },
-    {
-        "nome": "Regione Lombardia — Art.16 portale lavoro",
-        "url":  "https://www.lavoro.regione.lombardia.it/avvisi-art16",
-        "ssl":  True,
-    },
-    {
-        "nome": "Regione Veneto — Art.16 centri impiego",
-        "url":  "https://www.cliclavoroveneto.it/art-16",
-        "ssl":  True,
-    },
-    {
-        "nome": "Regione Sicilia — Art.16 ANPAL",
-        "url":  "https://www.sicilialavoro.it/avvisi-art-16",
+        "nome": "SINTESI Puglia — Art.16 Brindisi",
+        "url":  "https://sintesi.regione.puglia.it/web/sintesi-brindisi/articolo-16",
         "ssl":  False,
     },
     {
-        "nome": "Regione Basilicata — Art.16",
-        "url":  "https://www.basilicatalavoro.it/avvisi-art-16",
+        "nome": "SINTESI Puglia — Art.16 Taranto",
+        "url":  "https://sintesi.regione.puglia.it/web/sintesi-taranto/articolo-16",
         "ssl":  False,
     },
-    # Mappa nazionale (JS ma proviamo comunque)
     {
-        "nome": "ARL — Mappa aste Art.16 Italia",
+        "nome": "SINTESI Puglia — Art.16 Foggia",
+        "url":  "https://sintesi.regione.puglia.it/web/sintesi-foggia/articolo-16",
+        "ssl":  False,
+    },
+    # ── ABRUZZO ────────────────────────────────────────────────
+    {
+        "nome": "Abruzzo — SELFI selezioni",
+        "url":  "https://selfi.regione.abruzzo.it/menu_items/selezioni",
+        "ssl":  True,
+    },
+    # ── BASILICATA ─────────────────────────────────────────────
+    {
+        "nome": "Basilicata — Agenzia Regionale Lab",
+        "url":  "https://www.agenziaregionalelab.it/category/avvisi-e-bandi-c-p-i/",
+        "ssl":  True,
+    },
+    # ── EMILIA-ROMAGNA — mappa nazionale ───────────────────────
+    {
+        "nome": "Emilia-Romagna — Mappa aste Art.16",
         "url":  "https://www.agenzialavoro.emr.it/mappe-aste-art-16",
         "ssl":  True,
     },
+    # ── FRIULI-VENEZIA GIULIA ───────────────────────────────────
+    {
+        "nome": "Friuli VG — Bandi avvisi CPI",
+        "url":  "https://www.regione.fvg.it/rafvg/cms/RAFVG/MODULI/bandi_avvisi/?p=cpi",
+        "ssl":  True,
+    },
+    # ── LAZIO ──────────────────────────────────────────────────
+    {
+        "nome": "Lazio — Avviamento Art.16 L.56/87",
+        "url":  "https://www.regione.lazio.it/cittadini/lavoro/offerte-di-lavoro-bandi-avvisi/Avviamento-ex-art-16-L56-1987",
+        "ssl":  True,
+    },
+    # ── LIGURIA — 4 province ────────────────────────────────────
+    {
+        "nome": "Liguria — Chiamate Art.16 Genova",
+        "url":  "https://www.regione.liguria.it/homepage-lavoro/come-fare-per/chiamate-pubbliche/chiamate-exart16-ge.html",
+        "ssl":  True,
+    },
+    {
+        "nome": "Liguria — Chiamate Art.16 Imperia",
+        "url":  "https://www.regione.liguria.it/homepage-lavoro/come-fare-per/chiamate-pubbliche/chiamate-exart16-im.html",
+        "ssl":  True,
+    },
+    {
+        "nome": "Liguria — Chiamate Art.16 La Spezia",
+        "url":  "https://www.regione.liguria.it/homepage-lavoro/come-fare-per/chiamate-pubbliche/chiamate-exart16-sp.html",
+        "ssl":  True,
+    },
+    {
+        "nome": "Liguria — Chiamate Art.16 Savona",
+        "url":  "https://www.regione.liguria.it/homepage-lavoro/come-fare-per/chiamate-pubbliche/chiamate-exart16-sa.html",
+        "ssl":  True,
+    },
+    # ── MARCHE ─────────────────────────────────────────────────
+    {
+        "nome": "Marche — JANET Art.16 avvisi pubblici",
+        "url":  "https://janet.regione.marche.it/Art16_AvvisiPubblici/Articolo16/Ricerca",
+        "ssl":  True,
+    },
+    # ── PIEMONTE ───────────────────────────────────────────────
+    {
+        "nome": "Piemonte — Agenzia Piemonte Lavoro chiamate",
+        "url":  "https://agenziapiemontelavoro.it/scheda-informativa/offerte-di-lavoro/chiamata-pubblica/chiamata-pubblica-chiamate-integrate/",
+        "ssl":  True,
+    },
+    # ── SARDEGNA ───────────────────────────────────────────────
+    {
+        "nome": "Sardegna — Agenzia Reg. Lavoro Art.16",
+        "url":  "https://agenziaregionaleperillavoro.regione.sardegna.it/index.php?xsl=2362&s=44&v=9&c=93504&nodesc=2&c1=4920&tipodoc=2&tipoconc=2",
+        "ssl":  False,
+    },
+    # ── TOSCANA ────────────────────────────────────────────────
+    {
+        "nome": "Toscana — ARTI avvisi pubblici altri enti",
+        "url":  "https://arti.toscana.it/avvisi-pubblici-degli-altri-enti",
+        "ssl":  True,
+    },
+    # ── TRENTINO-ALTO ADIGE ─────────────────────────────────────
+    {
+        "nome": "Trentino — Concorsi e selezioni",
+        "url":  "https://www.regione.taa.it/Documenti/Concorsi-e-selezioni",
+        "ssl":  True,
+    },
+    # ── UMBRIA — 6 territori ────────────────────────────────────
+    {
+        "nome": "Umbria — Avvisi Art.16 Perugia",
+        "url":  "https://www.arpalumbria.it/territorio-perugia-avvisi-attivi-selezione-lavoro-nella-pubblica-amministrazione",
+        "ssl":  True,
+    },
+    {
+        "nome": "Umbria — Avvisi Art.16 Foligno",
+        "url":  "https://www.arpalumbria.it/territorio-foligno-avvisi-attivi-selezione-lavoro-nella-pubblica-amministrazione",
+        "ssl":  True,
+    },
+    {
+        "nome": "Umbria — Avvisi Art.16 Città di Castello",
+        "url":  "https://www.arpalumbria.it/territorio-citta-di-castello-avvisi-attivi-selezione-lavoro-nella-pubblica-amministrazione",
+        "ssl":  True,
+    },
+    {
+        "nome": "Umbria — Avvisi Art.16 Terni",
+        "url":  "https://www.arpalumbria.it/territorio-terni-avvisi-attivi-selezione-lavoro-nella-pubblica-amministrazione",
+        "ssl":  True,
+    },
+    {
+        "nome": "Umbria — Avvisi Art.16 Orvieto",
+        "url":  "https://www.arpalumbria.it/territorio-orvieto-avvisi-attivi-selezione-lavoro-nella-pubblica-amministrazione",
+        "ssl":  True,
+    },
+    {
+        "nome": "Umbria — Avvisi Art.16 regionale",
+        "url":  "https://www.arpalumbria.it/territorio-regionale-avvisi-attivi-selezione-lavoro-nella-pubblica-amministrazione",
+        "ssl":  True,
+    },
+    # ── VALLE D'AOSTA ───────────────────────────────────────────
+    {
+        "nome": "Valle d'Aosta — Chiamate pubbliche attive",
+        "url":  "https://lavoro.regione.vda.it/cittadini/lavoro/chiamate-pubbliche/chiamate-pubbliche-attive",
+        "ssl":  True,
+    },
+    # ── VENETO ─────────────────────────────────────────────────
+    {
+        "nome": "Veneto — Assunzioni PA ex Art.16 L.56/87",
+        "url":  "https://concorsi.regione.veneto.it/home/assunzioni-nella-pubblica-amministrazione-ex-art-16-l-56-87",
+        "ssl":  True,
+    },
+    # ── CALABRIA (confermato funzionante) ──────────────────────
+    {
+        "nome": "Calabria — Avviamenti Art.16",
+        "url":  "https://lavoro.regione.calabria.it/offerte-di-lavoro/aste-articolo-16/",
+        "ssl":  False,
+    },
 ]
-
 
 def scrape_aste_art16() -> list[Annuncio]:
     """
@@ -883,29 +924,60 @@ RICHIEDE_LAUREA = [
     "laurea magistrale", "laurea specialistica", "laurea triennale",
     "laureati", "laurea in ", "in possesso di laurea",
     "dirigente medico", "dirigenti medici",
-    "medico", "odontoiatra", "farmacista", "veterinario",
+    "medico specialista", "odontoiatra", "farmacista", "veterinario",
     "ingegnere", "architetto", "avvocato",
     "dottorato", "master universitario",
+    "funzionario direttivo",   # area funzionari richiede laurea
 ]
 
-# Parole che confermano accessibilità con diploma
+# Profili amministrativi accessibili con diploma — CERCATI ATTIVAMENTE
+PROFILI_AMMINISTRATIVI = [
+    # Profili espliciti
+    "istruttore amministrativo", "istruttore amm",
+    "collaboratore amministrativo", "collaboratore amm",
+    "assistente amministrativo", "assistente amm",
+    "funzionario amministrativo",  # alcuni con diploma
+    "addetto amministrativo", "addetto amm",
+    "impiegato di concetto", "impiegato amm",
+    "operatore amministrativo",
+    # Tribunali e giustizia
+    "operatore giudiziario", "operatrice giudiziaria",
+    "assistente giudiziario", "assistente di cancelleria",
+    "cancelliere", "ufficiale giudiziario",
+    "addetto ufficio per il processo",
+    "ministero della giustizia",
+    "corte di appello", "tribunale",
+    # Categorie contrattuali compatibili
+    "area degli istruttori", "area istruttori",
+    "area degli assistenti", "area assistenti",
+    "area degli operatori", "area operatori",
+    "categoria b", "categoria c",
+    "area b", "area c",
+    # Altre figure amministrative
+    "segretario", "archivista", "protocollo",
+    "ufficio personale", "ragioniere", "contabile",
+    "sportello", "front office", "back office",
+    "usciere", "messo comunale", "commesso",
+    "centralinista",
+]
+
+# Parole che confermano accessibilità con diploma (più ampio)
 OK_DIPLOMA = [
     "diploma", "scuola secondaria superiore", "maturità",
     "licenza media", "scuola dell'obbligo",
-    "istruttore", "collaboratore", "assistente",
-    "operatore", "addetto", "esecutore",
-    "categoria b", "categoria c", "area b", "area c",
-    "area degli assistenti", "area degli operatori",
-]
+] + PROFILI_AMMINISTRATIVI
+
+
+def profilo_ok(t: str) -> bool:
+    """True se il bando riguarda un profilo amministrativo cercato."""
+    return has(t, PROFILI_AMMINISTRATIVI)
 
 
 def richiede_solo_laurea(t: str) -> bool:
     """True se il testo indica chiaramente che serve la laurea."""
     low = t.lower()
-    # se menziona diploma, è probabilmente accessibile
     if has(low, OK_DIPLOMA):
         return False
-    # se menziona laurea senza diploma, escludi
     return has(low, RICHIEDE_LAUREA)
 
 
@@ -926,6 +998,25 @@ def filtra(items: list[Annuncio]) -> list[Annuncio]:
         soglia = 0 if a.tipo == "ART16" else 12
         if a.score < soglia:
             sc_score += 1;                                          continue
+
+        # Per le aste Art.16: tieni tutte MA filtra per profilo
+        # se il titolo menziona esplicitamente un profilo NON amministrativo
+        # (es. "manovratore", "operaio", "autista") scarta
+        if a.tipo == "ART16":
+            profili_tecnici = [
+                "operaio", "manovratore", "autista", "conducente",
+                "giardiniere", "netturbino", "spazzino", "ecologico",
+                "idraulico", "elettricista", "falegname", "muratore",
+                "cuoco", "cameriere", "custode", "guardia",
+                "bidello", "collaboratore scolastico",
+                "operatore ecologico",
+            ]
+            tit_low = a.titolo.lower()
+            # Se il titolo menziona un profilo tecnico/manuale NON cercato
+            # e non menziona nulla di amministrativo → salta
+            if has(tit_low, profili_tecnici) and not profilo_ok(tit_low):
+                log.debug(f"Skip profilo tecnico: {a.titolo[:60]}")
+                continue
 
         # ── Filtro CP + Art.1 ─────────────────────────────────
         # Le aste ART16 passano direttamente, gli altri devono avere CP/Art16
@@ -1028,15 +1119,16 @@ def invia_telegram(items: list[Annuncio]) -> None:
         elif a.descrizione:
             estratto = a.descrizione[:300]
 
-        # Segnala se il bando sembra accessibile con diploma
-        diploma_ok = has(
-            " ".join([a.titolo, a.descrizione, a.testo]).lower(),
-            OK_DIPLOMA
-        )
-        diploma_nota = " [diploma OK]" if diploma_ok else ""
+        # Segnala profilo e diploma nel messaggio
+        testo_ann = " ".join([a.titolo, a.descrizione, a.testo]).lower()
+        p_ok  = profilo_ok(testo_ann)
+        d_ok  = has(testo_ann, OK_DIPLOMA)
+        note  = ""
+        if p_ok:  note += " [profilo AMM]"
+        elif d_ok: note += " [diploma OK]"
 
         msg = (
-            f"{tipo_label}{diploma_nota}\n"
+            f"{tipo_label}{note}\n"
             f"{a.titolo[:120]}\n\n"
             f"Ente: {a.ente or a.fonte}\n"
             + (f"Scadenza: {a.scadenza}\n" if a.scadenza else "")
