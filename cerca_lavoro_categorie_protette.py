@@ -1162,10 +1162,17 @@ def filtra(items: list[Annuncio]) -> list[Annuncio]:
 # TELEGRAM — un messaggio per annuncio + riepilogo iniziale
 # ============================================================
 
-def tg(text: str) -> None:
-    """Invia un singolo messaggio Telegram (testo puro, max 4096 char)."""
+def tg(text: str, tentativo: int = 1) -> bool:
+    """
+    Invia un messaggio Telegram rispettando il rate limit.
+    Se arriva 429, legge il retry_after dalla risposta e aspetta.
+    Riprova fino a 3 volte prima di arrendersi.
+    """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        return False
+    if tentativo > 3:
+        log.error("Telegram: troppi tentativi, messaggio saltato")
+        return False
     try:
         r = S.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -1174,9 +1181,25 @@ def tg(text: str) -> None:
                   "disable_web_page_preview": True},
             timeout=12,
         )
+        if r.status_code == 429:
+            # Telegram dice esattamente quanto aspettare
+            try:
+                retry_after = r.json().get("parameters", {}).get("retry_after", 30)
+            except Exception:
+                retry_after = 30
+            log.warning(f"Telegram 429 — aspetto {retry_after}s (tentativo {tentativo}/3)")
+            time.sleep(retry_after + 1)   # +1 secondo di margine
+            return tg(text, tentativo + 1)
         r.raise_for_status()
+        return True
     except Exception as e:
+        if "429" in str(e):
+            wait = 30 * tentativo
+            log.warning(f"Telegram 429 (eccezione) — aspetto {wait}s")
+            time.sleep(wait)
+            return tg(text, tentativo + 1)
         log.error(f"Telegram → {e}")
+        return False
 
 
 def invia_telegram(items: list[Annuncio]) -> None:
@@ -1199,7 +1222,7 @@ def invia_telegram(items: list[Annuncio]) -> None:
         f"  Art.1 L.68/99:         {len(art1)}\n"
         f"  Altri concorsi PA:     {len(altri)}"
     )
-    time.sleep(0.5)
+    time.sleep(2)   # pausa dopo il riepilogo
 
     # ── Messaggi singoli per ogni annuncio ──────────────────
     for a in items:
@@ -1236,7 +1259,7 @@ def invia_telegram(items: list[Annuncio]) -> None:
             + f"\n{a.url}"
         )
         tg(msg)
-        time.sleep(0.4)   # anti-rate-limit Telegram
+        time.sleep(1.5)   # pausa minima tra messaggi (Telegram: max ~1/sec)
 
     log.info(f"Telegram: inviati {len(items) + 1} messaggi")
 
