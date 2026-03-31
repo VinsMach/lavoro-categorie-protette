@@ -607,6 +607,212 @@ def scrape_gu() -> list[Annuncio]:
 
 
 # ============================================================
+# ③ Aste Art.16 — portali regionali di tutta Italia
+#
+# L'Art.16 L.56/87 è l'accesso DIRETTO alla PA (senza concorso,
+# solo licenza media richiesta). Ogni regione gestisce le proprie
+# aste tramite il CPI / agenzia regionale per il lavoro.
+#
+# Priorità assoluta: Puglia (ARPAL + SINTESI Lecce)
+# Poi tutte le altre regioni per completezza nazionale.
+# ============================================================
+
+ASTE_ART16_FONTI = [
+    # ── PUGLIA — massima priorità ─────────────────────────────
+    {
+        "nome": "ARPAL Puglia — Offerte PA Art.16",
+        "url":  "https://arpal.regione.puglia.it/opportunita/offerte-lavoro-pa-articolo-16",
+        "ssl":  False,
+    },
+    # SINTESI = portale aste Art.16 per provincia di Lecce
+    {
+        "nome": "SINTESI — Art.16 Provincia di Lecce",
+        "url":  "https://sintesi.regione.puglia.it/sintesi/avvisiSelezioneList.do?provincia=LE&tipoAvviso=ART16",
+        "ssl":  False,
+    },
+    {
+        "nome": "SINTESI — Art.16 Provincia di Brindisi",
+        "url":  "https://sintesi.regione.puglia.it/sintesi/avvisiSelezioneList.do?provincia=BR&tipoAvviso=ART16",
+        "ssl":  False,
+    },
+    {
+        "nome": "SINTESI — Art.16 Provincia di Taranto",
+        "url":  "https://sintesi.regione.puglia.it/sintesi/avvisiSelezioneList.do?provincia=TA&tipoAvviso=ART16",
+        "ssl":  False,
+    },
+    # ── EMILIA-ROMAGNA — agenzialavoro.emr.it ─────────────────
+    # Province ER con aste aperte (le altre sono spesso vuote)
+    {
+        "nome": "ARL Emilia-Romagna — Aste Art.16 Bologna",
+        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/bo",
+        "ssl":  True,
+    },
+    {
+        "nome": "ARL Emilia-Romagna — Aste Art.16 Modena",
+        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/mo",
+        "ssl":  True,
+    },
+    {
+        "nome": "ARL Emilia-Romagna — Aste Art.16 Reggio Emilia",
+        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/re",
+        "ssl":  True,
+    },
+    {
+        "nome": "ARL Emilia-Romagna — Aste Art.16 Ferrara",
+        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/fe",
+        "ssl":  True,
+    },
+    {
+        "nome": "ARL Emilia-Romagna — Aste Art.16 Ravenna",
+        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/ra",
+        "ssl":  True,
+    },
+    {
+        "nome": "ARL Emilia-Romagna — Aste Art.16 Parma",
+        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/pr",
+        "ssl":  True,
+    },
+    {
+        "nome": "ARL Emilia-Romagna — Aste Art.16 Rimini",
+        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/rn",
+        "ssl":  True,
+    },
+    {
+        "nome": "ARL Emilia-Romagna — Aste Art.16 Forlì-Cesena",
+        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/fc",
+        "ssl":  True,
+    },
+    {
+        "nome": "ARL Emilia-Romagna — Aste Art.16 Piacenza",
+        "url":  "https://www.agenzialavoro.emr.it/assunzioni-art-16/aste-aperte/pc",
+        "ssl":  True,
+    },
+    # ── CALABRIA ──────────────────────────────────────────────
+    {
+        "nome": "Regione Calabria — Avviamenti Art.16",
+        "url":  "https://lavoro.regione.calabria.it/offerte-di-lavoro/aste-articolo-16/",
+        "ssl":  False,
+    },
+    # ── ALTRE REGIONI ─────────────────────────────────────────
+    {
+        "nome": "Regione Toscana — Art.16 CPI",
+        "url":  "https://www.regione.toscana.it/avvisi-art-16",
+        "ssl":  True,
+    },
+    {
+        "nome": "Regione Lazio — Art.16 ARPAL Lazio",
+        "url":  "https://www.arpalazio.it/avvisi-art-16",
+        "ssl":  True,
+    },
+    {
+        "nome": "Regione Campania — Art.16 ARLAS",
+        "url":  "https://www.arlas.it/avvisi-art-16/",
+        "ssl":  True,
+    },
+    {
+        "nome": "Regione Lombardia — Art.16 portale lavoro",
+        "url":  "https://www.lavoro.regione.lombardia.it/avvisi-art16",
+        "ssl":  True,
+    },
+    {
+        "nome": "Regione Veneto — Art.16 centri impiego",
+        "url":  "https://www.cliclavoroveneto.it/art-16",
+        "ssl":  True,
+    },
+    {
+        "nome": "Regione Sicilia — Art.16 ANPAL",
+        "url":  "https://www.sicilialavoro.it/avvisi-art-16",
+        "ssl":  False,
+    },
+    {
+        "nome": "Regione Basilicata — Art.16",
+        "url":  "https://www.basilicatalavoro.it/avvisi-art-16",
+        "ssl":  False,
+    },
+    # Mappa nazionale (JS ma proviamo comunque)
+    {
+        "nome": "ARL — Mappa aste Art.16 Italia",
+        "url":  "https://www.agenzialavoro.emr.it/mappe-aste-art-16",
+        "ssl":  True,
+    },
+]
+
+
+def scrape_aste_art16() -> list[Annuncio]:
+    """
+    Scarica le aste Art.16 da tutti i portali regionali italiani.
+    L'Art.16 L.56/87 = accesso diretto alla PA, solo licenza media,
+    riservato agli iscritti alle liste di collocamento.
+    NON confondere con Art.16 L.68/99 (collocamento mirato disabili).
+    Qui intendiamo Art.16 L.56/87 nella sua accezione di
+    chiamata numerica dagli iscritti al collocamento.
+    """
+    log.info("⭐ Aste Art.16 L.56/87 — portali regionali...")
+    items = []
+    seen_href: set[str] = set()
+
+    for fonte in ASTE_ART16_FONTI:
+        nome = fonte["nome"]
+        url  = fonte["url"]
+        ssl  = fonte["ssl"]
+
+        pg = soup(url, ssl=ssl, timeout=TIMEOUT_FAST)
+        if not pg:
+            continue
+
+        # Cerca tutti i link/item nella pagina
+        trovati_qui = 0
+        for sel in ["article", "li", "tr", ".entry", ".avviso", ".bando",
+                    "div.item", "a[href]"]:
+            for el in pg.select(sel):
+                lnk = el if el.name == "a" else el.select_one("a[href]")
+                if not lnk:
+                    continue
+                href   = aurl(lnk.get("href", ""), url)
+                titolo = n(lnk.get_text(" ", strip=True))
+                ctx    = n(el.get_text(" ", strip=True))
+                full   = f"{titolo} {ctx} {href}".lower()
+
+                if href in seen_href or len(titolo) < 8:
+                    continue
+                # Salta link di navigazione chiari
+                if any(nav in titolo.lower() for nav in [
+                    "home", "privacy", "contatti", "newsletter",
+                    "mappa", "geolocalizzazione", "indietro", "vai al",
+                    "come accedere", "compilare il modulo",
+                ]):
+                    continue
+                # Salta se è chiaramente una graduatoria/esito già concluso
+                if neg(full):
+                    continue
+
+                seen_href.add(href)
+
+                # Ogni link su questi portali È per definizione Art.16
+                # Aggiusta il tipo e i flag
+                a = Annuncio(
+                    titolo=titolo[:240],
+                    fonte=nome,
+                    url=href,
+                    ente=nome,
+                    tipo="ART16",        # tipo dedicato per aste art.16
+                    data_pub=first_date(ctx),
+                    descrizione=ctx[:400],
+                    art16=True,          # per definizione
+                    art1=False,
+                )
+                finalize(a)
+                items.append(a)
+                trovati_qui += 1
+
+        if trovati_qui:
+            log.info(f"   ✓ {nome}: {trovati_qui} candidati")
+
+    log.info(f"   → {len(items)} aste Art.16 totali")
+    return items
+
+
+# ============================================================
 # ③–⑪ Scraper generico HTML
 # ============================================================
 
@@ -714,13 +920,16 @@ def filtra(items: list[Annuncio]) -> list[Annuncio]:
         if neg(t):                                                  continue
         if expired(a.scadenza):                                     continue
         if too_old(a.data_pub):                                     continue
-        if a.tipo not in ("ARPAL", "AGGREGATORE") and not geo(t):  continue
-        if a.score < 12:
+        if a.tipo not in ("ARPAL", "AGGREGATORE", "ART16") and not geo(t):  continue
+        # Per le aste Art.16 L.56/87 abbassa la soglia score
+        # (sono già filtrate per definizione sul portale)
+        soglia = 0 if a.tipo == "ART16" else 12
+        if a.score < soglia:
             sc_score += 1;                                          continue
 
         # ── Filtro CP + Art.1 ─────────────────────────────────
-        # Il bando deve avere almeno un segnale CP/Art16
-        if not (cp(t) or a16(t)):                                   continue
+        # Le aste ART16 passano direttamente, gli altri devono avere CP/Art16
+        if a.tipo != "ART16" and not (cp(t) or a16(t)):            continue
 
         # ESCLUDI se il bando è riservato solo all'Art.18
         # (orfani, vedove, vittime terrorismo — categoria diversa)
@@ -790,11 +999,13 @@ def invia_telegram(items: list[Annuncio]) -> None:
     altri = [a for a in items if not a.art1 and not a.art16]
 
     # ── Messaggio 1: riepilogo ──────────────────────────────
+    aste16 = [a for a in items if a.tipo == "ART16"]
     tg(
-        f"Categorie Protette — Lecce / Salento\n"
+        f"Categorie Protette + Aste Art.16\n"
         f"{datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
         f"Annunci trovati: {len(items)}\n"
-        f"  Art.16 accesso diretto: {len(art16)}\n"
+        f"  Aste Art.16 L.56/87:   {len(aste16)}\n"
+        f"  Art.16 accesso diretto:{len(art16)}\n"
         f"  Art.1 L.68/99:         {len(art1)}\n"
         f"  Altri concorsi PA:     {len(altri)}"
     )
@@ -803,6 +1014,7 @@ def invia_telegram(items: list[Annuncio]) -> None:
     # ── Messaggi singoli per ogni annuncio ──────────────────
     for a in items:
         tipo_label = (
+            "[ART.16 ASTA DIRETTA]"    if a.tipo == "ART16" else
             "[ART.16 ACCESSO DIRETTO]" if a.art16 else
             "[ART.1 L.68/99]"          if a.art1  else
             "[PA]"
@@ -860,6 +1072,12 @@ def main() -> None:
         raw.extend(scrape_gu())
     except Exception as e:
         log.error(f"GU → {e}")
+
+    # Aste Art.16 — portali regionali Italia
+    try:
+        raw.extend(scrape_aste_art16())
+    except Exception as e:
+        log.error(f"Aste Art.16 → {e}")
 
     # Tutte le fonti HTML
     for fonte in FONTI_HTML:
