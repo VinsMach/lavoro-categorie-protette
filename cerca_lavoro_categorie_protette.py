@@ -855,66 +855,142 @@ ASTE_ART16_FONTI = [
 
 def scrape_aste_art16() -> list[Annuncio]:
     """
-    Scarica le aste Art.16 da tutti i portali regionali italiani.
-    L'Art.16 L.56/87 = accesso diretto alla PA, solo licenza media,
-    riservato agli iscritti alle liste di collocamento.
-    NON confondere con Art.16 L.68/99 (collocamento mirato disabili).
-    Qui intendiamo Art.16 L.56/87 nella sua accezione di
-    chiamata numerica dagli iscritti al collocamento.
+    Scarica aste Art.16 dai portali regionali con filtri molto rigidi.
+
+    Regole di ammissione per ogni link/elemento trovato:
+    - L'URL deve puntare a una pagina di contenuto (non #anchor, non mailto:,
+      non /menu_items/, non pagine di navigazione generiche)
+    - Il titolo deve avere almeno 20 caratteri
+    - Il titolo/contesto deve contenere almeno una parola chiave di offerta
+      (avviamento, selezione, assunzione, concorso, posto, unità, profilo)
+    - Il titolo non deve essere una voce di menu nota
+    - Il contesto non deve essere solo una email o un indirizzo PEC
     """
-    log.info("⭐ Aste Art.16 L.56/87 — portali regionali...")
-    items = []
-    seen_href: set[str] = set()
+    log.info("⭐ Aste Art.16 — portali regionali...")
+    items: list[Annuncio] = []
+    seen: set[str] = set()
+
+    # Parole che DEVONO essere presenti nel titolo/contesto per accettare il link
+    MUST_HAVE = [
+        'avviamento', 'selezione', 'assunzione', 'concorso', 'bando',
+        'posto', 'posti', 'unità', 'profilo professionale',
+        'istruttore', 'collaboratore', 'assistente', 'operatore',
+        'funzionario', 'addetto', 'impiegato', 'cancelliere',
+        'giudiziario', 'amministrativo', 'messo', 'usciere',
+        'tempo determinato', 'tempo indeterminato',
+        'art. 16', 'art.16', 'l. 56', 'l.56',
+    ]
+
+    # Pattern URL da scartare sempre
+    URL_SKIP = [
+        'mailto:', '#', 'javascript:', 'tel:',
+        '/menu_items/', '/menu/', '/home', '/index',
+        '/privacy', '/cookie', '/accessibilita', '/sitemap',
+        '/contatti', '/chi-siamo', '/faq', '/news$', '/osservatorio',
+        '/apprendistato', '/tirocini', '/formazione', '/istruzione',
+        '/its$', '/scuola', '/link', '/photo', '/video', '/calendar',
+        '/come-funziona', '/come-aderire', '/contacts',
+        'facebook.com', 'linkedin.com', 'instagram.com', 'twitter.com',
+        'youtube.com', 'whatsapp',
+    ]
+
+    # Titoli di voci di menu/navigazione da scartare
+    TITLES_SKIP = {
+        'home', 'news', 'contatti', 'chi siamo', 'privacy', 'cookie',
+        'mappa del sito', 'accessibilità', 'link utili', 'faq',
+        'newsletter', 'osservatorio', 'logout', 'login', 'accedi',
+        'registrati', 'cerca', 'vai al contenuto', 'vai al footer',
+        'raggiungi il piè di pagina', 'agenzia', 'opportunità',
+        'cittadini', 'imprese', 'photo gallery', 'video gallery',
+        'apprendistato', 'tirocini', 'formazione', 'istruzione',
+        'facebook', 'linkedin', 'instagram', 'twitter', 'youtube',
+        'finalità e destinatari', 'modulistica', 'offerte di lavoro',
+        'richieste di personale', "centri per l'impiego",
+        'potenziamento cpi', 'programma gol', 'its academy',
+        'corsi riconosciuti', 'voucher', 'bandi e avvisi',
+        'servizio2@pec.arpalumbria.it', 'servizio1@pec.arpalumbria.it',
+    }
+
+    def url_ok(href: str) -> bool:
+        if not href or len(href) < 10:
+            return False
+        low = href.lower()
+        # Scarta anchor puri (#footer, #main, ecc.)
+        if href.startswith('#'):
+            return False
+        # Scarta se contiene pattern da saltare
+        return not any(p in low for p in URL_SKIP)
+
+    def title_ok(title: str) -> bool:
+        t = title.strip()
+        if len(t) < 15:
+            return False
+        tl = t.lower()
+        # Scarta email
+        if '@' in t or 'mailto:' in tl:
+            return False
+        # Scarta voci di menu note
+        if tl in TITLES_SKIP or any(tl.startswith(s) for s in ['vai ', 'accedi ', 'skip ', 'raggiungi ']):
+            return False
+        return True
+
+    def is_offerta(titolo: str, ctx: str) -> bool:
+        """Il contenuto deve parlare di un'offerta/avviso reale."""
+        full = (titolo + ' ' + ctx).lower()
+        return any(kw in full for kw in MUST_HAVE)
 
     for fonte in ASTE_ART16_FONTI:
-        nome = fonte["nome"]
-        url  = fonte["url"]
-        ssl  = fonte["ssl"]
+        nome = fonte['nome']
+        url  = fonte['url']
+        ssl  = fonte['ssl']
 
         pg = soup(url, ssl=ssl, timeout=TIMEOUT_FAST)
         if not pg:
             continue
 
-        # Cerca tutti i link/item nella pagina
+        # Rimuovi sempre nav, header, footer, menu, sidebar prima di analizzare
+        for tag in pg.select('nav, header, footer, .nav, .navbar, .menu, '
+                              '.sidebar, aside, .breadcrumb, .social, '
+                              'script, style, noscript'):
+            tag.decompose()
+
         trovati_qui = 0
-        for sel in ["article", "li", "tr", ".entry", ".avviso", ".bando",
-                    "div.item", "a[href]"]:
+
+        # Cerca link con contesto
+        for sel in ['article', 'li', 'tr', '.avviso', '.selezione',
+                    '.bando', '.entry', 'div.views-row', 'div.item',
+                    'a[href]']:
             for el in pg.select(sel):
-                lnk = el if el.name == "a" else el.select_one("a[href]")
+                lnk = el if el.name == 'a' else el.select_one('a[href]')
                 if not lnk:
                     continue
-                href   = aurl(lnk.get("href", ""), url)
-                titolo = n(lnk.get_text(" ", strip=True))
-                ctx    = n(el.get_text(" ", strip=True))
-                full   = f"{titolo} {ctx} {href}".lower()
 
-                if href in seen_href or len(titolo) < 8:
+                href   = aurl(lnk.get('href', ''), url)
+                titolo = n(lnk.get_text(' ', strip=True))
+                ctx    = n(el.get_text(' ', strip=True))
+
+                # Filtri rigidi
+                if not url_ok(href):
                     continue
-                # Salta link di navigazione chiari
-                if any(nav in titolo.lower() for nav in [
-                    "home", "privacy", "contatti", "newsletter",
-                    "mappa", "geolocalizzazione", "indietro", "vai al",
-                    "come accedere", "compilare il modulo",
-                ]):
+                if not title_ok(titolo):
                     continue
-                # Salta se è chiaramente una graduatoria/esito già concluso
-                if neg(full):
+                if not is_offerta(titolo, ctx):
+                    continue
+                if neg(ctx.lower()):
+                    continue
+                if href in seen:
                     continue
 
-                seen_href.add(href)
-
-                # Ogni link su questi portali È per definizione Art.16
-                # Aggiusta il tipo e i flag
+                seen.add(href)
                 a = Annuncio(
                     titolo=titolo[:240],
                     fonte=nome,
                     url=href,
                     ente=nome,
-                    tipo="ART16",        # tipo dedicato per aste art.16
+                    tipo='ART16',
                     data_pub=first_date(ctx),
                     descrizione=ctx[:400],
-                    art16=True,          # per definizione
-                    art1=False,
+                    art16=True,
                 )
                 finalize(a)
                 items.append(a)
@@ -925,7 +1001,6 @@ def scrape_aste_art16() -> list[Annuncio]:
 
     log.info(f"   → {len(items)} aste Art.16 totali")
     return items
-
 
 # ============================================================
 # ③–⑪ Scraper generico HTML
@@ -1072,15 +1147,13 @@ def filtra(items: list[Annuncio]) -> list[Annuncio]:
         if neg(t):                                                  continue
 
         # ── Verifica scadenza ─────────────────────────────────
-        # Se il testo completo è disponibile, prova a estrarre la
-        # scadenza da lì (più accurato dello snippet iniziale)
+        # Prova a estrarre scadenza da testo completo, poi da descrizione
         if a.testo and not a.scadenza:
             a.scadenza = scad_from(a.testo)
-        # Ri-verifica anche dalla descrizione se ancora non trovata
         if not a.scadenza and a.descrizione:
             a.scadenza = scad_from(a.descrizione)
 
-        # Scarta se la scadenza è passata
+        # Scarta se la scadenza è esplicitamente passata
         if expired(a.scadenza):
             log.info(f"Scaduto ({a.scadenza}): {a.titolo[:55]}")
             continue
@@ -1090,7 +1163,18 @@ def filtra(items: list[Annuncio]) -> list[Annuncio]:
             log.info(f"Bando chiuso (testo): {a.titolo[:55]}")
             continue
 
-        if too_old(a.data_pub):                                     continue
+        # Scarta per data pubblicazione troppo vecchia
+        if too_old(a.data_pub):
+            log.info(f"Troppo vecchio ({a.data_pub}): {a.titolo[:55]}")
+            continue
+
+        # Se non abbiamo né scadenza né data_pub, ma il testo menziona
+        # anni passati (2024 o precedenti) senza menzionare 2025/2026 → scarta
+        if not a.scadenza and not a.data_pub:
+            anni_testo = set(re.findall(r'20(2[0-9])', t))
+            if anni_testo and max(anni_testo) < '25':
+                log.info(f"Anno passato nel testo: {a.titolo[:55]}")
+                continue
         if a.tipo not in ("ARPAL", "AGGREGATORE", "ART16") and not geo(t):  continue
         # Per le aste Art.16 L.56/87 abbassa la soglia score
         # (sono già filtrate per definizione sul portale)
