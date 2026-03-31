@@ -57,7 +57,6 @@ TIMEOUT_FAST = 12
 SLEEP        = 1.2
 MAX_DETTAGLI = 40          # quante pagine di dettaglio aprire
 GIORNI_MAX   = 120         # scarta annunci pubblicati da oltre N giorni
-GIORNI_SCAD  = 7           # tolleranza scadenza (annunci scaduti da max N giorni)
 
 
 # ============================================================
@@ -413,13 +412,83 @@ def first_date(t: str) -> str:
     d = dates(t); return d[0] if d else ""
 
 def scad_from(t: str) -> str:
-    for p in [
-        r"(?:scadenza|termine(?:\s+di)?\s+presentazione|entro(?:\s+il)?)[:\s]+([0-3]?\d[/\-.][01]?\d[/\-.]20\d{2})",
-        r"(?:scadenza|entro(?:\s+il)?)[:\s]+([0-3]?\d\s+(?:gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)\s+20\d{2})",
-    ]:
-        m = re.search(p, t.lower())
-        if m: return first_date(m.group(1))
+    """Estrae data di scadenza con pattern multipli e robusti."""
+    tl = t.lower()
+    MESI = {
+        'gennaio': 1, 'febbraio': 2, 'marzo': 3, 'aprile': 4,
+        'maggio': 5, 'giugno': 6, 'luglio': 7, 'agosto': 8,
+        'settembre': 9, 'ottobre': 10, 'novembre': 11, 'dicembre': 12,
+    }
+    MESI_PAT = '|'.join(MESI.keys())
+
+    def parse_dmy(s):
+        s = s.replace(' ', '')
+        for fmt in ('%d/%m/%Y', '%d-%m-%Y', '%d.%m.%Y'):
+            try:
+                return datetime.strptime(s, fmt).strftime('%Y-%m-%d')
+            except ValueError:
+                pass
+        return ''
+
+    # 1. keyword + dd/mm/yyyy (con qualsiasi separatore / - .)
+    m = re.search(
+        r'(?:scadenza|scad\.?|termine(?:\s+\w+)*|entro(?:\s+il)?'
+        r'|chiusura\s+candidature|data(?:\s+di)?\s+(?:chiusura|scadenza))'
+        r'[\s:]+([0-3]?\d[\s]*[/\-\.][ ]*[01]?\d[\s]*[/\-\.][ ]*20\d{2})',
+        tl
+    )
+    if m:
+        d = parse_dmy(m.group(1))
+        if d: return d
+
+    # 2. keyword + mese italiano
+    m = re.search(
+        r'(?:scadenza|scad\.?|termine(?:\s+\w+)*|entro(?:\s+il)?|chiusura)'
+        r'[\s:]+([0-3]?\d\s+(?:' + MESI_PAT + r')\s+20\d{2})',
+        tl
+    )
+    if m:
+        parts = m.group(1).split()
+        try:
+            return datetime(int(parts[2]), MESI[parts[1]], int(parts[0])).strftime('%Y-%m-%d')
+        except (ValueError, KeyError, IndexError):
+            pass
+
+    # 3. "fino al dd/mm/yyyy"
+    m = re.search(
+        r'fino\s+al\s+([0-3]?\d[\s]*[/\-\.][ ]*[01]?\d[\s]*[/\-\.][ ]*20\d{2})',
+        tl
+    )
+    if m:
+        d = parse_dmy(m.group(1))
+        if d: return d
+
+    # 4. data ISO yyyy-mm-dd — cerca keyword nelle 60 chars precedenti
+    for m in re.finditer(r'(20\d{2}-[01]\d-[0-3]\d)', tl):
+        before = tl[max(0, m.start() - 60):m.start()]
+        if re.search(r'scadenza|termine|entro|chiusura|scad\.?|fino\s+al', before):
+            return m.group(1)
+
     return ""
+
+def bando_chiuso_nel_testo(t: str) -> bool:
+    """Rileva bandi chiusi/conclusi da frasi tipiche nel testo."""
+    segnali = [
+        "termini scaduti", "termine scaduto",
+        "candidature chiuse", "candidature concluse",
+        "procedura conclusa", "selezione conclusa",
+        "bando scaduto", "avviso scaduto",
+        "graduatoria definitiva approvata",
+        "assunzione effettuata", "posto coperto",
+        "procedura archiviata", "procedura chiusa",
+        "asta chiusa", "asta conclusa",
+        "avviamento effettuato", "avviamento concluso",
+        "non ci sono aste aperte",
+        "nessuna asta aperta", "nessun avviso attivo",
+        "al momento non sono presenti",
+        "non sono presenti avvisi",
+    ]
+    return has(t, segnali)
 
 def posti_from(t: str) -> str:
     for p in [r"\b(?:n\.?|nr\.?|numero)\s*(\d+)\s*(?:posti?|unità|unita)\b",
@@ -435,8 +504,13 @@ def to_dt(s: str) -> Optional[datetime]:
     return None
 
 def expired(s: str) -> bool:
+    """True se la data è passata. Nessuna tolleranza — scaduto = scaduto."""
     dt = to_dt(s)
-    return bool(dt and dt < datetime.now() - timedelta(days=GIORNI_SCAD))
+    if not dt:
+        return False
+    # Confronta solo la data (non l'ora) per evitare falsi positivi
+    # dovuti a bandi che scadono alle 23:59 del giorno indicato
+    return dt.date() < datetime.now().date()
 
 def too_old(s: str) -> bool:
     if not s: return False
@@ -905,7 +979,13 @@ def fetch_detail(a: Annuncio) -> Annuncio:
     if not r: return a
     if "pdf" in (r.headers.get("Content-Type") or "").lower(): return a
     a.testo = page_text(BeautifulSoup(r.text, "html.parser"))
-    return finalize(a)
+    finalize(a)
+    # Tenta di estrarre/aggiornare la scadenza dal testo completo
+    if not a.scadenza:
+        a.scadenza = scad_from(a.testo)
+    if a.scadenza:
+        log.debug(f"   Scadenza estratta: {a.scadenza} — {a.titolo[:50]}")
+    return a
 
 def fetch_best(items: list[Annuncio]) -> None:
     ordered = sorted(items, key=lambda x: (x.art16, x.art1, x.score), reverse=True)
@@ -990,7 +1070,26 @@ def filtra(items: list[Annuncio]) -> list[Annuncio]:
         t = " ".join([a.titolo, a.descrizione, a.testo, a.url]).lower()
 
         if neg(t):                                                  continue
-        if expired(a.scadenza):                                     continue
+
+        # ── Verifica scadenza ─────────────────────────────────
+        # Se il testo completo è disponibile, prova a estrarre la
+        # scadenza da lì (più accurato dello snippet iniziale)
+        if a.testo and not a.scadenza:
+            a.scadenza = scad_from(a.testo)
+        # Ri-verifica anche dalla descrizione se ancora non trovata
+        if not a.scadenza and a.descrizione:
+            a.scadenza = scad_from(a.descrizione)
+
+        # Scarta se la scadenza è passata
+        if expired(a.scadenza):
+            log.info(f"Scaduto ({a.scadenza}): {a.titolo[:55]}")
+            continue
+
+        # Scarta se il testo dice esplicitamente che è chiuso/concluso
+        if bando_chiuso_nel_testo(t):
+            log.info(f"Bando chiuso (testo): {a.titolo[:55]}")
+            continue
+
         if too_old(a.data_pub):                                     continue
         if a.tipo not in ("ARPAL", "AGGREGATORE", "ART16") and not geo(t):  continue
         # Per le aste Art.16 L.56/87 abbassa la soglia score
@@ -1131,7 +1230,7 @@ def invia_telegram(items: list[Annuncio]) -> None:
             f"{tipo_label}{note}\n"
             f"{a.titolo[:120]}\n\n"
             f"Ente: {a.ente or a.fonte}\n"
-            + (f"Scadenza: {a.scadenza}\n" if a.scadenza else "")
+            + (f"Scadenza: {a.scadenza}\n" if a.scadenza else "Scadenza: da verificare\n")
             + (f"Posti:    {a.posti}\n"    if a.posti    else "")
             + (f"\n{estratto}\n"            if estratto   else "")
             + f"\n{a.url}"
